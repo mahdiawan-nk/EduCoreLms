@@ -1,0 +1,6 @@
+{
+  "name": "Politeknik Kampar LMS",
+  "description": "Full Digital Classroom Learning Management System for Politeknik Kampar with RBAC, Course & Classroom Management, Assignments, Quizzes, and Gradebook.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
