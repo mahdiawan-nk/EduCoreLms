@@ -23,8 +23,20 @@ import {
   Eye,
   Film,
   Clock,
+  BarChart3,
+  History,
+  TrendingUp,
+  Search,
+  Copy,
+  Archive,
+  RotateCcw,
+  ArrowUp,
+  ArrowDown,
+  Menu,
+  MoreHorizontal,
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { canPerformMutations, isAuditorUser } from '../lib/authorization';
 import { AppShell } from '../components/AppShell';
 import {
   Button,
@@ -36,11 +48,19 @@ import {
   ModalDialog,
   ConfirmDialog,
 } from '../components/ui/primitives';
-import { apiRequest } from '../lib/api';
+import { apiRequest, apiFetch } from '../lib/api';
 import { formatDateTime } from '../lib/utils';
+import { ClassroomSettingsCenter } from '../components/classroom/ClassroomSettingsCenter';
 import { toast } from 'sonner';
+import { useDeleteConfirmation } from '../hooks/useDeleteConfirmation';
+import { InstructorAnalyticsDashboard } from '../components/classroom/InstructorAnalyticsDashboard';
+import { StudentDashboardOverview } from '../components/classroom/StudentDashboardOverview';
+import { QuickNavigationSidebar } from '../components/classroom/QuickNavigationSidebar';
+import { LearningProgressTab } from '../components/classroom/LearningProgressTab';
+import { ChangeHistoryTab } from '../components/classroom/ChangeHistoryTab';
 
-type ClassroomTab = 'stream' | 'classwork' | 'people' | 'grades' | 'settings';
+type ClassroomTab = 'stream' | 'classwork' | 'people' | 'grades' | 'analytics' | 'settings';
+type ClassworkSubTab = 'overview' | 'modules' | 'assignments' | 'assessments' | 'progress' | 'history';
 
 export function ClassroomPage() {
   const { id } = useParams<{ id: string }>();
@@ -49,6 +69,17 @@ export function ClassroomPage() {
   const queryClient = useQueryClient();
 
   const [activeTab, setActiveTab] = useState<ClassroomTab>('stream');
+  const [classworkSubTab, setClassworkSubTab] = useState<ClassworkSubTab>('modules');
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
+  const [classroomSearch, setClassroomSearch] = useState('');
+  const [editingModule, setEditingModule] = useState<{
+    id: string;
+    title: string;
+    description: string;
+    status: string;
+  } | null>(null);
+  const deleteConfirm = useDeleteConfirmation();
 
   // Stream comment inputs keyed by announcementId
   const [commentTexts, setCommentTexts] = useState<Record<string, string>>({});
@@ -97,6 +128,91 @@ export function ClassroomPage() {
     queryFn: () => apiRequest<any>(`/classrooms/${id}`),
     enabled: Boolean(id),
     retry: false,
+  });
+
+  const analyticsSummaryQuery = useQuery({
+    queryKey: ['classroom-analytics', id],
+    queryFn: () => apiFetch<any>(`/api/v1/classrooms/${id}/analytics`),
+    enabled: Boolean(id && classroomQuery.data?.data?.access?.canManage),
+  });
+
+  const searchQuery = useQuery({
+    queryKey: ['classroom-search', id, classroomSearch],
+    queryFn: () =>
+      apiRequest<any>(
+        `/classrooms/${id}/search?q=${encodeURIComponent(classroomSearch.trim())}`
+      ).then((r) => r.data),
+    enabled: Boolean(id && classroomSearch.trim().length >= 2),
+  });
+
+  const updateModuleMutation = useMutation({
+    mutationFn: (payload: { moduleId: string; data: any }) =>
+      apiRequest(`/classrooms/${id}/modules/${payload.moduleId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload.data),
+      }),
+    onSuccess: () => {
+      toast.success('Modul berhasil diperbarui.');
+      setEditingModule(null);
+      queryClient.invalidateQueries({ queryKey: ['classroom-detail', id] });
+      queryClient.invalidateQueries({ queryKey: ['classwork-navigation', id] });
+      queryClient.invalidateQueries({ queryKey: ['classroom-change-history', id] });
+    },
+    onError: (err: any) => toast.error(err?.message || 'Gagal memperbarui modul.'),
+  });
+
+  const deleteModuleMutation = useMutation({
+    mutationFn: (moduleId: string) =>
+      apiRequest(`/classrooms/${id}/modules/${moduleId}`, { method: 'DELETE' }),
+    onSuccess: () => {
+      toast.success('Modul berhasil dihapus.');
+      queryClient.invalidateQueries({ queryKey: ['classroom-detail', id] });
+      queryClient.invalidateQueries({ queryKey: ['classwork-navigation', id] });
+      queryClient.invalidateQueries({ queryKey: ['classroom-change-history', id] });
+    },
+    onError: (err: any) => toast.error(err?.message || 'Gagal menghapus modul.'),
+  });
+
+  const duplicateModuleMutation = useMutation({
+    mutationFn: (moduleId: string) =>
+      apiRequest(`/classrooms/${id}/modules/${moduleId}/duplicate`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      }),
+    onSuccess: () => {
+      toast.success('Modul berhasil diduplikasi.');
+      queryClient.invalidateQueries({ queryKey: ['classroom-detail', id] });
+      queryClient.invalidateQueries({ queryKey: ['classwork-navigation', id] });
+    },
+    onError: (err: any) => toast.error(err?.message || 'Gagal menduplikasi modul.'),
+  });
+
+  const reorderModulesMutation = useMutation({
+    mutationFn: (moduleIds: string[]) =>
+      apiRequest(`/classrooms/${id}/modules/reorder`, {
+        method: 'POST',
+        body: JSON.stringify({ moduleIds }),
+      }),
+    onSuccess: () => {
+      toast.success('Urutan modul diperbarui.');
+      queryClient.invalidateQueries({ queryKey: ['classroom-detail', id] });
+      queryClient.invalidateQueries({ queryKey: ['classwork-navigation', id] });
+    },
+    onError: (err: any) => toast.error(err?.message || 'Gagal mengubah urutan modul.'),
+  });
+
+  const duplicateResourceMutation = useMutation({
+    mutationFn: (params: { type: 'materials' | 'assignments' | 'assessments'; resourceId: string }) =>
+      apiRequest(`/${params.type}/${params.resourceId}/duplicate`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      }),
+    onSuccess: () => {
+      toast.success('Item berhasil diduplikasi sebagai draf.');
+      queryClient.invalidateQueries({ queryKey: ['classroom-detail', id] });
+      queryClient.invalidateQueries({ queryKey: ['classwork-navigation', id] });
+    },
+    onError: (err: any) => toast.error(err?.message || 'Gagal menduplikasi item.'),
   });
 
   // Forms
@@ -439,7 +555,10 @@ export function ClassroomPage() {
     gradebook,
   } = classroomQuery.data.data;
 
-  const canManage = Boolean(access?.canManage);
+  const isAuditor = isAuditorUser(user);
+  const canMutate = canPerformMutations(user);
+  const canManage = Boolean(access?.canManage) && canMutate;
+  const canInspectAll = canManage || isAuditor;
   const activeJoinCode =
     joinCodes?.find((jc: any) => jc.isActive)?.code || null;
   const activeStudents = enrollments.filter(
@@ -451,71 +570,147 @@ export function ClassroomPage() {
 
   return (
     <AppShell breadcrumb={classroom.name}>
-      {/* Classroom Institutional Banner */}
-      <div className="rounded-xl border border-slate-200 bg-slate-900 p-6 sm:p-8 text-white">
-        <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-6">
-          <div>
-            <div className="flex flex-wrap items-center gap-2 text-xs text-amber-400">
-              <span className="font-mono font-semibold tabular-nums">
-                {classroom.course?.code || 'MK'}
-              </span>
-              <span aria-hidden="true">·</span>
-              <span>{classroom.course?.studyProgram}</span>
-              <span aria-hidden="true">·</span>
-              <span className="font-mono tabular-nums">
-                {classroom.course?.credits || 3} SKS
-              </span>
-              <span aria-hidden="true">·</span>
-              <span>{classroom.semester?.name}</span>
+      {/* =====================================================================
+          COMPACT ACADEMIC CLASSROOM HEADER & RESPONSIVE 6-TAB NAVIGATION
+      ===================================================================== */}
+      <div className="rounded-2xl border border-[#E2E8F0] bg-white shadow-xs overflow-hidden">
+        {classroom.coverImagePath ? (
+          <div className="relative h-24 sm:h-28 w-full bg-[#14213D] overflow-hidden">
+            <img
+              src={`/api/v1/storage/${classroom.coverImagePath}`}
+              alt={classroom.name}
+              className="h-full w-full object-cover opacity-80"
+            />
+            <div className="absolute inset-0 bg-gradient-to-t from-[#14213D]/70 via-transparent to-transparent" />
+          </div>
+        ) : (
+          <div className="h-1.5 w-full bg-gradient-to-r from-[#14213D] via-[#1E3A5F] to-[#2563EB]" />
+        )}
+
+        <div className="p-4 sm:p-6">
+          <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-4">
+            <div className="min-w-0 space-y-2">
+              <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-medium">
+                <span className="inline-flex items-center rounded-md bg-[#14213D] px-2 py-0.5 font-mono font-semibold text-white tabular-nums">
+                  {classroom.course?.code || 'MK'}
+                </span>
+                {classroom.course?.studyProgram && (
+                  <span className="inline-flex items-center rounded-md bg-[#F7F9FC] border border-[#E2E8F0] px-2 py-0.5 text-[#172033]">
+                    {classroom.course.studyProgram}
+                  </span>
+                )}
+                <span className="inline-flex items-center rounded-md bg-[#F7F9FC] border border-[#E2E8F0] px-2 py-0.5 font-mono tabular-nums text-[#64748B]">
+                  {classroom.course?.credits || 3} SKS
+                </span>
+                {classroom.semester?.name && (
+                  <span className="inline-flex items-center rounded-md bg-blue-50 border border-blue-200 px-2 py-0.5 text-[#2563EB] font-semibold">
+                    {classroom.semester.name}
+                  </span>
+                )}
+                <span
+                  className={`inline-flex items-center rounded-md px-2 py-0.5 font-semibold ${
+                    classroom.isArchived
+                      ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                      : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                  }`}
+                >
+                  {classroom.isArchived ? 'Diarsipkan' : 'Aktif'}
+                </span>
+              </div>
+
+              <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-[#172033] break-words">
+                {classroom.name}
+              </h1>
+
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#64748B]">
+                <span>
+                  <strong className="font-semibold text-[#172033]">
+                    {instructors[0]?.fullName || 'Dosen Pengampu'}
+                  </strong>
+                  {instructors.length > 1 ? ` (+${instructors.length - 1} lainnya)` : ''}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span>{classroom.section}</span>
+                {classroom.roomNumber && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span>Ruang {classroom.roomNumber}</span>
+                  </>
+                )}
+                {classroom.scheduleText && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span>{classroom.scheduleText}</span>
+                  </>
+                )}
+              </div>
+
+              {classroom.description && (
+                <p className="text-xs text-[#64748B] max-w-3xl leading-relaxed line-clamp-2">
+                  {classroom.description}
+                </p>
+              )}
             </div>
 
-            <h1 className="mt-2 text-2xl sm:text-3xl font-bold tracking-tight text-white">
-              {classroom.name}
-            </h1>
-            <p className="mt-1 text-sm text-slate-300">
-              {classroom.section} · {classroom.roomNumber} ·{' '}
-              {classroom.scheduleText}
-            </p>
-            {classroom.description && (
-              <p className="mt-2 text-xs text-slate-400 max-w-2xl">
-                {classroom.description}
-              </p>
-            )}
-          </div>
-
-          {/* Join Code & Capacity Box */}
-          <div className="flex flex-wrap items-center gap-6 rounded-lg border border-slate-800 bg-slate-800/80 px-5 py-3.5 shrink-0">
-            {canManage && (
-              <div>
-                <p className="text-xs text-slate-400">Kode Kelas Aktif</p>
-                <p className="mt-0.5 font-mono text-lg font-bold text-amber-400 tabular-nums">
-                  {activeJoinCode || 'DICABUT'}
+            {/* Compact Join Code & Capacity Strip */}
+            <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-stretch gap-2.5 shrink-0">
+              {canManage && (
+                <div className="rounded-xl border border-[#E2E8F0] bg-[#F7F9FC] px-3.5 py-2.5 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-[11px] font-medium text-[#64748B]">Kode Kelas</p>
+                    <p className="font-mono text-sm sm:text-base font-bold text-[#14213D] tabular-nums truncate">
+                      {activeJoinCode || 'DICABUT'}
+                    </p>
+                  </div>
+                  {activeJoinCode && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard?.writeText(activeJoinCode);
+                        toast.success(`Kode kelas ${activeJoinCode} disalin.`);
+                      }}
+                      className="p-1.5 rounded-lg border border-[#E2E8F0] bg-white text-[#64748B] hover:text-[#2563EB] hover:border-blue-200 transition-colors cursor-pointer"
+                      title="Salin Kode Kelas"
+                      aria-label="Salin Kode Kelas"
+                    >
+                      <Copy className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+              )}
+              <div className="rounded-xl border border-[#E2E8F0] bg-[#F7F9FC] px-3.5 py-2.5">
+                <p className="text-[11px] font-medium text-[#64748B]">Peserta Aktif</p>
+                <p className="font-mono text-sm sm:text-base font-bold text-[#172033] tabular-nums">
+                  {activeStudents.length}{' '}
+                  <span className="text-xs font-normal text-[#64748B]">
+                    / {classroom.capacity}
+                  </span>
                 </p>
               </div>
-            )}
-            <div className={canManage ? 'border-l border-slate-700 pl-6' : ''}>
-              <p className="text-xs text-slate-400">Peserta Aktif</p>
-              <p className="mt-0.5 font-mono text-lg font-bold text-white tabular-nums">
-                {activeStudents.length} / {classroom.capacity}
-              </p>
             </div>
           </div>
         </div>
 
-        {/* 5 Required Classroom Navigation Tabs: Stream, Classwork, People, Grades, Settings */}
-        <div className="mt-8 pt-4 border-t border-slate-800 flex flex-wrap items-center gap-2">
+        {/* Desktop & Tablet Horizontal Tab Navigation */}
+        <nav
+          aria-label="Navigasi Ruang Kelas"
+          className="hidden md:flex items-center gap-1 border-t border-[#E2E8F0] bg-[#F7F9FC]/70 px-4 sm:px-6 overflow-x-auto"
+        >
           {(
             [
-              { id: 'stream', label: '1. Stream', icon: MessageSquare },
-              { id: 'classwork', label: '2. Classwork', icon: BookOpen },
+              { id: 'stream', label: 'Stream', icon: MessageSquare },
+              { id: 'classwork', label: 'Classwork', icon: BookOpen },
               {
                 id: 'people',
-                label: `3. People (${activeStudents.length})`,
+                label: `People (${activeStudents.length})`,
                 icon: Users,
               },
-              { id: 'grades', label: '4. Grades', icon: Award },
+              { id: 'grades', label: 'Grades', icon: Award },
               ...(canManage
-                ? [{ id: 'settings', label: '5. Settings', icon: Settings }]
+                ? [
+                    { id: 'analytics', label: 'Analytics', icon: BarChart3 },
+                    { id: 'settings', label: 'Settings', icon: Settings },
+                  ]
                 : []),
             ] as const
           ).map((tab) => {
@@ -526,17 +721,102 @@ export function ClassroomPage() {
                 key={tab.id}
                 type="button"
                 onClick={() => setActiveTab(tab.id as ClassroomTab)}
-                className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                className={`inline-flex items-center gap-2 px-4 py-3 text-xs font-semibold border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   active
-                    ? 'bg-amber-500 text-slate-950'
-                    : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+                    ? 'border-[#2563EB] text-[#14213D] bg-white'
+                    : 'border-transparent text-[#64748B] hover:text-[#172033] hover:bg-white/60'
                 }`}
               >
-                <Icon className="h-3.5 w-3.5" />
+                <Icon className={`h-3.5 w-3.5 ${active ? 'text-[#2563EB]' : ''}`} />
                 <span>{tab.label}</span>
               </button>
             );
           })}
+        </nav>
+
+        {/* Mobile 5-Destination Tab Bar (< 768px) */}
+        <div className="md:hidden border-t border-[#E2E8F0] bg-[#F7F9FC]/80">
+          <div className={`grid ${canManage ? 'grid-cols-5' : 'grid-cols-4'} gap-0.5 p-1`}>
+            {(
+              [
+                { id: 'stream', label: 'Stream', icon: MessageSquare },
+                { id: 'classwork', label: 'Tugas', icon: BookOpen },
+                { id: 'people', label: 'Peserta', icon: Users },
+                { id: 'grades', label: 'Nilai', icon: Award },
+              ] as const
+            ).map((tab) => {
+              const Icon = tab.icon;
+              const active = activeTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => {
+                    setActiveTab(tab.id as ClassroomTab);
+                    setMobileMoreOpen(false);
+                  }}
+                  className={`flex flex-col items-center justify-center gap-1 py-2 px-1 rounded-lg text-[10px] font-semibold transition-colors cursor-pointer ${
+                    active
+                      ? 'bg-white text-[#2563EB] shadow-2xs border border-[#E2E8F0]'
+                      : 'text-[#64748B] hover:text-[#172033]'
+                  }`}
+                >
+                  <Icon className="h-3.5 w-3.5 shrink-0" />
+                  <span className="truncate max-w-full">{tab.label}</span>
+                </button>
+              );
+            })}
+
+            {canManage && (
+              <button
+                type="button"
+                onClick={() => setMobileMoreOpen((prev) => !prev)}
+                className={`flex flex-col items-center justify-center gap-1 py-2 px-1 rounded-lg text-[10px] font-semibold transition-colors cursor-pointer ${
+                  activeTab === 'analytics' || activeTab === 'settings' || mobileMoreOpen
+                    ? 'bg-white text-[#2563EB] shadow-2xs border border-[#E2E8F0]'
+                    : 'text-[#64748B] hover:text-[#172033]'
+                }`}
+              >
+                <MoreHorizontal className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate max-w-full">Lainnya</span>
+              </button>
+            )}
+          </div>
+
+          {canManage && mobileMoreOpen && (
+            <div className="border-t border-[#E2E8F0] bg-white p-2 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveTab('analytics');
+                  setMobileMoreOpen(false);
+                }}
+                className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg text-xs font-semibold border cursor-pointer ${
+                  activeTab === 'analytics'
+                    ? 'bg-[#14213D] text-white border-[#14213D]'
+                    : 'bg-[#F7F9FC] text-[#172033] border-[#E2E8F0]'
+                }`}
+              >
+                <BarChart3 className="h-3.5 w-3.5" />
+                <span>Analytics</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveTab('settings');
+                  setMobileMoreOpen(false);
+                }}
+                className={`flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg text-xs font-semibold border cursor-pointer ${
+                  activeTab === 'settings'
+                    ? 'bg-[#14213D] text-white border-[#14213D]'
+                    : 'bg-[#F7F9FC] text-[#172033] border-[#E2E8F0]'
+                }`}
+              >
+                <Settings className="h-3.5 w-3.5" />
+                <span>Settings</span>
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -544,41 +824,139 @@ export function ClassroomPage() {
           TAB 1: STREAM (ANNOUNCEMENTS & CLASS DISCUSSION)
       ===================================================================== */}
       {activeTab === 'stream' && (
-        <div className="mt-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <div className="mt-6 space-y-6">
+          {!canManage && !isAuditor && id && <StudentDashboardOverview classroomId={id} />}
+
+          {/* Instructor Contextual Real-Time Statistics Strip (4 cols desktop, 2 cols mobile/tablet) */}
+          {canManage && (
+            <div className="space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="text-xs font-bold uppercase tracking-wider text-[#64748B] flex items-center gap-1.5">
+                  <BarChart3 className="h-3.5 w-3.5 text-[#2563EB]" />
+                  <span>Ringkasan Aktivitas Kelas</span>
+                </h2>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('analytics')}
+                  className="text-xs font-semibold text-[#2563EB] hover:underline cursor-pointer"
+                >
+                  Lihat Analitik Lengkap →
+                </button>
+              </div>
+              {analyticsSummaryQuery.isLoading ? (
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                  {Array.from({ length: 4 }).map((_, idx) => (
+                    <Skeleton key={idx} className="h-20 rounded-xl" />
+                  ))}
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                  <Card className="p-3.5 sm:p-4 border-[#E2E8F0] bg-white">
+                    <div className="flex items-center justify-between text-[#64748B]">
+                      <span className="text-[11px] font-semibold">Peserta Aktif</span>
+                      <Users className="h-3.5 w-3.5 text-[#2563EB]" />
+                    </div>
+                    <p className="mt-1.5 font-mono text-lg sm:text-xl font-bold text-[#172033] tabular-nums">
+                      {analyticsSummaryQuery.data?.overview?.activeStudents ?? activeStudents.length}{' '}
+                      <span className="text-xs font-normal text-[#64748B]">
+                        / {classroom.capacity}
+                      </span>
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-[#64748B]">
+                      {pendingStudents.length} menunggu persetujuan
+                    </p>
+                  </Card>
+
+                  <Card className="p-3.5 sm:p-4 border-[#E2E8F0] bg-white">
+                    <div className="flex items-center justify-between text-[#64748B]">
+                      <span className="text-[11px] font-semibold">Modul & Materi</span>
+                      <BookOpen className="h-3.5 w-3.5 text-[#14213D]" />
+                    </div>
+                    <p className="mt-1.5 font-mono text-lg sm:text-xl font-bold text-[#172033] tabular-nums">
+                      {analyticsSummaryQuery.data?.overview?.totalModules ?? topics.length}{' '}
+                      <span className="text-xs font-normal text-[#64748B]">Modul</span>
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-[#64748B]">
+                      {analyticsSummaryQuery.data?.overview?.totalMaterials ?? materials.length} materi tersedia
+                    </p>
+                  </Card>
+
+                  <Card className="p-3.5 sm:p-4 border-[#E2E8F0] bg-white">
+                    <div className="flex items-center justify-between text-[#64748B]">
+                      <span className="text-[11px] font-semibold">Tugas & Evaluasi</span>
+                      <ClipboardList className="h-3.5 w-3.5 text-amber-600" />
+                    </div>
+                    <p className="mt-1.5 font-mono text-lg sm:text-xl font-bold text-[#172033] tabular-nums">
+                      {(analyticsSummaryQuery.data?.overview?.totalAssignments ?? assignments.length) +
+                        (analyticsSummaryQuery.data?.overview?.totalAssessments ?? assessments.length)}
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-[#64748B]">
+                      {analyticsSummaryQuery.data?.overview?.pendingGradingAssignmentsCount ?? 0} menunggu penilaian
+                    </p>
+                  </Card>
+
+                  <Card className="p-3.5 sm:p-4 border-[#E2E8F0] bg-white">
+                    <div className="flex items-center justify-between text-[#64748B]">
+                      <span className="text-[11px] font-semibold">Rata-rata Kelas</span>
+                      <Award className="h-3.5 w-3.5 text-emerald-600" />
+                    </div>
+                    <p className="mt-1.5 font-mono text-lg sm:text-xl font-bold text-[#172033] tabular-nums">
+                      {analyticsSummaryQuery.data?.overview?.classAverageGrade ?? '—'}
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-[#64748B]">
+                      Progres selesai {analyticsSummaryQuery.data?.overview?.learningCompletionRate ?? 0}%
+                    </p>
+                  </Card>
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           {/* Left Column: Summary & Upcoming */}
           <div className="lg:col-span-4 space-y-4">
-            <Card className="p-5">
-              <h3 className="text-sm font-bold text-slate-900">
+            <Card className="p-5 border-[#E2E8F0] bg-white">
+              <h3 className="text-sm font-bold text-[#172033]">
                 Informasi Ruang Kelas
               </h3>
-              <div className="mt-3 space-y-2 text-xs text-slate-600">
+              <div className="mt-3 space-y-2.5 text-xs text-[#64748B]">
                 <p>
-                  <span className="text-slate-500">Dosen Pengampu: </span>
-                  <strong className="text-slate-900">
+                  <span>Dosen Pengampu: </span>
+                  <strong className="text-[#172033]">
                     {instructors.map((i: any) => i.fullName).join(', ')}
                   </strong>
                 </p>
                 <p>
-                  <span className="text-slate-500">Kebijakan Pendaftaran: </span>
-                  <strong className="text-slate-900">
+                  <span>Kebijakan Pendaftaran: </span>
+                  <strong className="text-[#172033]">
                     {classroom.enrollmentPolicy === 'AUTO'
                       ? 'Otomatis Aktif'
                       : 'Persetujuan Dosen'}
                   </strong>
                 </p>
                 <p>
-                  <span className="text-slate-500">Total Tugas & Kuis: </span>
-                  <strong className="font-mono tabular-nums text-slate-900">
+                  <span>Total Tugas & Kuis: </span>
+                  <strong className="font-mono tabular-nums text-[#172033]">
                     {assignments.length} Tugas · {quizzes.length} Kuis
                   </strong>
                 </p>
+                {classroom.cpmk && (
+                  <div className="pt-2.5 border-t border-[#E2E8F0]">
+                    <span className="text-[#64748B] font-semibold block mb-1.5">
+                      Capaian Pembelajaran (CPMK):
+                    </span>
+                    <p className="text-[#172033] whitespace-pre-line leading-relaxed bg-[#F7F9FC] p-3 rounded-lg text-[11px] border border-[#E2E8F0]">
+                      {classroom.cpmk}
+                    </p>
+                  </div>
+                )}
               </div>
               {canManage && (
-                <div className="mt-4 pt-4 border-t border-slate-100">
+                <div className="mt-4 pt-4 border-t border-[#E2E8F0]">
                   <Button
                     type="button"
                     size="sm"
-                    className="w-full"
+                    className="w-full bg-[#2563EB] hover:bg-blue-700 text-white"
                     onClick={() => setAnnounceModalOpen(true)}
                   >
                     <Plus className="h-4 w-4" />
@@ -598,10 +976,13 @@ export function ClassroomPage() {
               />
             ) : (
               announcements.map((ann: any) => (
-                <Card key={ann.id} className="p-6">
-                  <div className="flex items-baseline justify-between gap-4">
-                    <div className="flex items-center gap-2 text-xs text-slate-500">
-                      <span className="font-semibold text-slate-800">
+                <Card key={ann.id} className="p-5 sm:p-6 border-[#E2E8F0] bg-white">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-[#64748B]">
+                      <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-[#14213D] text-[11px] font-bold text-white shrink-0">
+                        {(ann.authorName || 'D').charAt(0).toUpperCase()}
+                      </span>
+                      <span className="font-semibold text-[#172033]">
                         {ann.authorName}
                       </span>
                       <span aria-hidden="true">·</span>
@@ -609,39 +990,36 @@ export function ClassroomPage() {
                         {formatDateTime(ann.createdAt)}
                       </span>
                       {ann.isPinned && (
-                        <>
-                          <span aria-hidden="true">·</span>
-                          <span className="font-semibold text-amber-700">
-                            Disematkan
-                          </span>
-                        </>
+                        <span className="inline-flex items-center rounded-md bg-blue-50 border border-blue-200 px-2 py-0.5 text-[10px] font-semibold text-[#2563EB]">
+                          Disematkan
+                        </span>
                       )}
                     </div>
                   </div>
 
-                  <h3 className="mt-2 text-base font-bold text-slate-900">
+                  <h3 className="mt-3 text-base font-bold text-[#172033]">
                     {ann.title}
                   </h3>
-                  <p className="mt-2 text-sm text-slate-700 leading-relaxed whitespace-pre-line">
+                  <p className="mt-2 text-sm text-[#172033]/90 leading-relaxed whitespace-pre-line">
                     {ann.content}
                   </p>
 
                   {/* Comments Thread */}
-                  <div className="mt-5 pt-4 border-t border-slate-100 space-y-3">
+                  <div className="mt-5 pt-4 border-t border-[#E2E8F0] space-y-3">
                     {ann.comments?.map((c: any) => (
                       <div
                         key={c.id}
-                        className="rounded-lg bg-slate-50 px-3.5 py-2.5 text-xs"
+                        className="rounded-xl bg-[#F7F9FC] border border-[#E2E8F0] px-3.5 py-2.5 text-xs"
                       >
-                        <div className="flex items-center justify-between text-slate-500">
-                          <span className="font-semibold text-slate-900">
+                        <div className="flex flex-wrap items-center justify-between gap-1 text-[#64748B]">
+                          <span className="font-semibold text-[#172033]">
                             {c.authorName}
                           </span>
-                          <span className="font-mono tabular-nums">
+                          <span className="font-mono tabular-nums text-[11px]">
                             {formatDateTime(c.createdAt)}
                           </span>
                         </div>
-                        <p className="mt-1 text-slate-700">{c.content}</p>
+                        <p className="mt-1 text-[#172033]">{c.content}</p>
                       </div>
                     ))}
 
@@ -655,7 +1033,7 @@ export function ClassroomPage() {
                           content: text,
                         });
                       }}
-                      className="flex items-center gap-2 pt-1"
+                      className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 pt-1"
                     >
                       <Input
                         value={commentTexts[ann.id] || ''}
@@ -666,13 +1044,14 @@ export function ClassroomPage() {
                           }))
                         }
                         placeholder="Tulis tanggapan atau pertanyaan diskusi kelas..."
-                        className="h-9 text-xs"
+                        className="h-9 text-xs flex-1 min-w-0"
                       />
                       <Button
                         type="submit"
                         size="sm"
                         variant="outline"
                         disabled={commentMutation.isPending}
+                        className="shrink-0"
                       >
                         <Send className="h-3.5 w-3.5" />
                         <span>Kirim</span>
@@ -684,13 +1063,141 @@ export function ClassroomPage() {
             )}
           </div>
         </div>
+        </div>
       )}
 
       {/* =====================================================================
           TAB 2: CLASSWORK (TOPICS, MATERIALS, ASSIGNMENTS, QUIZZES)
       ===================================================================== */}
       {activeTab === 'classwork' && (
-        <div className="mt-6 space-y-8">
+        <div className="mt-6 space-y-5">
+          {/* Unified Classroom Search + Sub-navigation */}
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 bg-white border border-[#E2E8F0] rounded-xl p-3">
+            <div className="flex items-center gap-1.5 overflow-x-auto pb-1 md:pb-0">
+              <button
+                type="button"
+                onClick={() => setMobileNavOpen(true)}
+                className="lg:hidden inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-[#E2E8F0] text-xs font-semibold text-[#172033] shrink-0 cursor-pointer"
+              >
+                <Menu className="h-3.5 w-3.5" /> Navigasi
+              </button>
+              {(
+                [
+                  { id: 'overview', label: 'Ringkasan', icon: BarChart3 },
+                  { id: 'modules', label: 'Modul & Materi', icon: BookOpen },
+                  { id: 'assignments', label: 'Tugas', icon: ClipboardList },
+                  { id: 'assessments', label: 'Asesmen & Ujian', icon: HelpCircle },
+                  { id: 'progress', label: 'Progres Belajar', icon: TrendingUp },
+                  ...(canManage
+                    ? [{ id: 'history' as const, label: 'Riwayat Perubahan', icon: History }]
+                    : []),
+                ] as const
+              ).map((st) => {
+                const SIcon = st.icon;
+                const active = classworkSubTab === st.id;
+                return (
+                  <button
+                    key={st.id}
+                    type="button"
+                    onClick={() => setClassworkSubTab(st.id as ClassworkSubTab)}
+                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      active
+                        ? 'bg-[#14213D] text-white'
+                        : 'text-[#64748B] hover:bg-[#F7F9FC] hover:text-[#172033]'
+                    }`}
+                  >
+                    <SIcon className="h-3.5 w-3.5" />
+                    <span>{st.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="relative w-full md:w-72">
+              <Search className="h-3.5 w-3.5 text-slate-400 absolute left-3 top-2.5" />
+              <Input
+                value={classroomSearch}
+                onChange={(e) => setClassroomSearch(e.target.value)}
+                placeholder="Cari modul, materi, tugas, ujian..."
+                className="pl-8 h-8 text-xs"
+              />
+              {classroomSearch.trim().length >= 2 && searchQuery.data?.results && (
+                <div className="absolute right-0 left-0 top-9 z-30 bg-white border border-slate-200 rounded-xl shadow-lg max-h-72 overflow-y-auto p-2 space-y-1">
+                  {searchQuery.data.results.length === 0 ? (
+                    <p className="text-xs text-slate-500 p-2">Tidak ada hasil.</p>
+                  ) : (
+                    searchQuery.data.results.map((r: any) => (
+                      <button
+                        key={`${r.type}-${r.id}`}
+                        type="button"
+                        onClick={() => {
+                          setClassroomSearch('');
+                          if (r.type === 'MATERIAL') {
+                            navigate(`/classrooms/${id}/materials/${r.id}`);
+                          } else if (r.type === 'ASSIGNMENT') {
+                            navigate(
+                              canManage
+                                ? `/classrooms/${id}/assignments/${r.id}/monitoring`
+                                : `/classrooms/${id}/assignments/${r.id}`
+                            );
+                          } else if (r.type === 'ASSESSMENT') {
+                            navigate(
+                              canManage
+                                ? `/classrooms/${id}/assessments/${r.id}/monitoring`
+                                : `/classrooms/${id}/assessments/${r.id}/exam`
+                            );
+                          } else if (r.type === 'MODULE') {
+                            setClassworkSubTab('modules');
+                          } else {
+                            setActiveTab('stream');
+                          }
+                        }}
+                        className="w-full text-left px-2.5 py-2 rounded-lg hover:bg-slate-100 flex items-center justify-between gap-2 text-xs cursor-pointer"
+                      >
+                        <span className="font-medium text-slate-900 truncate">{r.title}</span>
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 shrink-0">
+                          {r.type}
+                        </span>
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Classwork Layout: Quick Navigation Sidebar + Content */}
+          <div className="flex gap-6 items-start">
+            {id && (
+              <QuickNavigationSidebar
+                classroomId={id}
+                canManage={canManage}
+                mobileOpen={mobileNavOpen}
+                onMobileClose={() => setMobileNavOpen(false)}
+              />
+            )}
+
+            <div className="flex-1 min-w-0 space-y-8">
+              {classworkSubTab === 'overview' && id && (
+                canManage ? (
+                  <InstructorAnalyticsDashboard classroomId={id} />
+                ) : (
+                  <StudentDashboardOverview classroomId={id} />
+                )
+              )}
+
+              {classworkSubTab === 'progress' && id && (
+                <LearningProgressTab classroomId={id} canManage={canManage} />
+              )}
+
+              {classworkSubTab === 'history' && canInspectAll && id && (
+                <ChangeHistoryTab classroomId={id} />
+              )}
+
+              {(classworkSubTab === 'modules' ||
+                classworkSubTab === 'assignments' ||
+                classworkSubTab === 'assessments') && (
+                <>
           {/* Instructor Action Toolbar */}
           {canManage && (
             <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white p-4">
@@ -767,7 +1274,7 @@ export function ClassroomPage() {
               )}
             </div>
 
-            {topics.map((t: any) => {
+            {topics.map((t: any, tIdx: number) => {
               const topicMats = materials.filter(
                 (m: any) => m.topicId === t.id
               );
@@ -775,9 +1282,16 @@ export function ClassroomPage() {
                 <Card key={t.id} className="p-6 space-y-4">
                   <div className="border-b border-slate-100 pb-3 flex flex-wrap items-center justify-between gap-2">
                     <div>
-                      <h3 className="text-base font-bold text-slate-900">
-                        {t.title}
-                      </h3>
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-base font-bold text-slate-900">
+                          {t.title}
+                        </h3>
+                        {t.status && t.status !== 'PUBLISHED' && (
+                          <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-mono font-semibold">
+                            {t.status}
+                          </span>
+                        )}
+                      </div>
                       {t.description && (
                         <p className="mt-0.5 text-xs text-slate-500">
                           {t.description}
@@ -785,17 +1299,116 @@ export function ClassroomPage() {
                       )}
                     </div>
                     {canManage && (
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        onClick={() =>
-                          navigate(`/classrooms/${id}/materials/new?topicId=${t.id}`)
-                        }
-                      >
-                        <Plus className="h-3.5 w-3.5" />
-                        <span>Tambah Materi di Modul Ini</span>
-                      </Button>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={tIdx === 0 || reorderModulesMutation.isPending}
+                          onClick={() => {
+                            const ids = topics.map((x: any) => x.id);
+                            [ids[tIdx - 1], ids[tIdx]] = [ids[tIdx], ids[tIdx - 1]];
+                            reorderModulesMutation.mutate(ids);
+                          }}
+                          title="Geser ke atas"
+                        >
+                          <ArrowUp className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={tIdx === topics.length - 1 || reorderModulesMutation.isPending}
+                          onClick={() => {
+                            const ids = topics.map((x: any) => x.id);
+                            [ids[tIdx], ids[tIdx + 1]] = [ids[tIdx + 1], ids[tIdx]];
+                            reorderModulesMutation.mutate(ids);
+                          }}
+                          title="Geser ke bawah"
+                        >
+                          <ArrowDown className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            setEditingModule({
+                              id: t.id,
+                              title: t.title,
+                              description: t.description || '',
+                              status: t.status || 'PUBLISHED',
+                            })
+                          }
+                          title="Edit Modul"
+                        >
+                          <Edit3 className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => duplicateModuleMutation.mutate(t.id)}
+                          title="Duplikasi Modul"
+                        >
+                          <Copy className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            updateModuleMutation.mutate({
+                              moduleId: t.id,
+                              data: {
+                                status: t.status === 'ARCHIVED' ? 'PUBLISHED' : 'ARCHIVED',
+                              },
+                            })
+                          }
+                          title={t.status === 'ARCHIVED' ? 'Pulihkan Modul' : 'Arsipkan Modul'}
+                        >
+                          {t.status === 'ARCHIVED' ? (
+                            <RotateCcw className="h-3.5 w-3.5" />
+                          ) : (
+                            <Archive className="h-3.5 w-3.5" />
+                          )}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            deleteConfirm.requestConfirmation({
+                              item: t,
+                              title: 'Hapus Modul Pembelajaran?',
+                              description: 'Apakah Anda yakin ingin menghapus modul pembelajaran ini?',
+                              itemName: t.title,
+                              warningText:
+                                topicMats.length > 0
+                                  ? `Terdapat ${topicMats.length} materi di dalam modul ini. Materi dan tugas terkait akan tetap tersimpan tanpa modul (tidak ikut terhapus).`
+                                  : 'Modul kosong ini akan dihapus secara permanen dari kelas.',
+                              actionLabel: 'Ya, Hapus Modul',
+                              onConfirm: async () => {
+                                await deleteModuleMutation.mutateAsync(t.id);
+                              },
+                            })
+                          }
+                          title="Hapus Modul"
+                        >
+                          <Trash2 className="h-3.5 w-3.5 text-rose-600" />
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            navigate(`/classrooms/${id}/materials/new?topicId=${t.id}`)
+                          }
+                        >
+                          <Plus className="h-3.5 w-3.5" />
+                          <span>Tambah Materi</span>
+                        </Button>
+                      </div>
                     )}
                   </div>
 
@@ -905,9 +1518,22 @@ export function ClassroomPage() {
 
                                     <button
                                       type="button"
-                                      onClick={() => deleteMaterialMutation.mutate(m.id)}
+                                      onClick={() =>
+                                        deleteConfirm.requestConfirmation({
+                                          item: m,
+                                          title: 'Hapus Materi Pembelajaran?',
+                                          description: 'Apakah Anda yakin ingin menghapus materi pembelajaran ini?',
+                                          itemName: m.title,
+                                          warningText:
+                                            'Materi pembelajaran beserta lampiran berkas dan catatan progres terkait akan dihapus secara permanen.',
+                                          actionLabel: 'Ya, Hapus Materi',
+                                          onConfirm: async () => {
+                                            await deleteMaterialMutation.mutateAsync(m.id);
+                                          },
+                                        })
+                                      }
                                       disabled={deleteMaterialMutation.isPending}
-                                      className="p-2 rounded-lg border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 transition"
+                                      className="p-2 rounded-lg border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 transition cursor-pointer"
                                       title="Hapus Materi"
                                     >
                                       <Trash2 className="h-3.5 w-3.5" />
@@ -1004,7 +1630,7 @@ export function ClassroomPage() {
                         </div>
 
                         <div className="flex flex-wrap items-center gap-2 shrink-0">
-                          {!canManage ? (
+                          {!canManage && !isAuditor ? (
                             <Link
                               to={`/classrooms/${id}/assignments/${asg.id}`}
                               className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold transition"
@@ -1016,6 +1642,23 @@ export function ClassroomPage() {
                                   : 'Buka Workspace & Kumpulkan Tugas'}
                               </span>
                             </Link>
+                          ) : isAuditor ? (
+                            <>
+                              <Link
+                                to={`/classrooms/${id}/assignments/${asg.id}/monitoring`}
+                                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold transition"
+                              >
+                                <Users className="h-3.5 w-3.5 text-amber-400" />
+                                <span>Monitoring & Nilai Peserta</span>
+                              </Link>
+                              <Link
+                                to={`/classrooms/${id}/assignments/${asg.id}`}
+                                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 text-xs font-semibold transition"
+                              >
+                                <Eye className="h-3.5 w-3.5" />
+                                <span>Lihat Instruksi</span>
+                              </Link>
+                            </>
                           ) : (
                             <>
                               <Link
@@ -1204,7 +1847,7 @@ export function ClassroomPage() {
                         </div>
 
                         <div className="flex flex-wrap items-center gap-2 shrink-0">
-                          {!canManage ? (
+                          {!canManage && !isAuditor ? (
                             <Link
                               to={`/classrooms/${id}/assessments/${asmt.id}`}
                               className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold transition"
@@ -1215,6 +1858,14 @@ export function ClassroomPage() {
                                   ? 'Lanjutkan Sesi Ujian'
                                   : 'Buka Ruang Ujian'}
                               </span>
+                            </Link>
+                          ) : isAuditor ? (
+                            <Link
+                              to={`/classrooms/${id}/assessments/${asmt.id}/monitoring`}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold transition"
+                            >
+                              <Users className="h-3.5 w-3.5 text-amber-400" />
+                              <span>Monitoring & Analitik Ujian</span>
                             </Link>
                           ) : (
                             <>
@@ -1287,7 +1938,7 @@ export function ClassroomPage() {
                           </p>
                         </div>
 
-                        {!canManage && (
+                        {!canManage && !isAuditor && (
                           <Button
                             type="button"
                             size="sm"
@@ -1330,6 +1981,10 @@ export function ClassroomPage() {
               </div>
             )}
           </div>
+                </>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
@@ -1338,28 +1993,28 @@ export function ClassroomPage() {
       ===================================================================== */}
       {activeTab === 'people' && (
         <div className="mt-6 space-y-6">
-          <Card className="p-6">
-            <h2 className="text-base font-bold text-slate-900">
+          <Card className="p-5 sm:p-6 border-[#E2E8F0] bg-white">
+            <h2 className="text-base font-bold text-[#172033]">
               Dosen Pengampu Ruang Kelas ({instructors.length})
             </h2>
-            <div className="mt-4 divide-y divide-slate-100">
+            <div className="mt-4 divide-y divide-[#E2E8F0]">
               {instructors.map((inst: any) => (
                 <div
                   key={inst.id}
-                  className="py-3 flex items-center justify-between text-sm"
+                  className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-sm"
                 >
-                  <div>
-                    <p className="font-semibold text-slate-900">
+                  <div className="min-w-0">
+                    <p className="font-semibold text-[#172033] truncate">
                       {inst.fullName}
                     </p>
-                    <p className="text-xs text-slate-500">
+                    <p className="text-xs text-[#64748B] truncate">
                       {inst.email} ·{' '}
                       <span className="font-mono tabular-nums">
                         {inst.identityNumber}
                       </span>
                     </p>
                   </div>
-                  <span className="text-xs font-medium text-slate-600">
+                  <span className="inline-flex w-fit items-center rounded-md bg-[#F7F9FC] border border-[#E2E8F0] px-2.5 py-1 text-xs font-medium text-[#14213D]">
                     {inst.isPrimary ? 'Koordinator Utama' : 'Dosen Anggota'}
                   </span>
                 </div>
@@ -1367,13 +2022,13 @@ export function ClassroomPage() {
             </div>
           </Card>
 
-          <Card className="p-6">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-4 border-b border-slate-100">
+          <Card className="p-5 sm:p-6 border-[#E2E8F0] bg-white">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-[#E2E8F0]">
               <div>
-                <h2 className="text-base font-bold text-slate-900">
+                <h2 className="text-base font-bold text-[#172033]">
                   Daftar Peserta Mahasiswa ({enrollments.length})
                 </h2>
-                <p className="text-xs text-slate-500">
+                <p className="text-xs text-[#64748B] mt-0.5">
                   Kapasitas kelas: {activeStudents.length} aktif dari maksimum{' '}
                   {classroom.capacity} kursi ({pendingStudents.length} menunggu persetujuan).
                 </p>
@@ -1383,18 +2038,106 @@ export function ClassroomPage() {
                   size="sm"
                   variant="outline"
                   onClick={() => navigate(`/classrooms/${id}/participants`)}
-                  className="text-xs text-blue-700 border-blue-200 hover:bg-blue-50 flex items-center gap-1.5"
+                  className="text-xs text-[#2563EB] border-blue-200 hover:bg-blue-50 flex items-center gap-1.5 shrink-0"
                 >
                   <Users className="w-3.5 h-3.5" />
-                  <span>Workspace Manajemen Peserta & Waitlist</span>
+                  <span>Manajemen Peserta & Waitlist</span>
                 </Button>
               )}
             </div>
 
-            <div className="overflow-x-auto mt-4">
+            {/* Mobile Card List (< 768px) */}
+            <div className="md:hidden mt-4 space-y-3">
+              {enrollments.map((enr: any) => (
+                <div
+                  key={enr.id}
+                  className="rounded-xl border border-[#E2E8F0] bg-[#F7F9FC] p-3.5 space-y-2.5"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-[#172033] truncate">
+                        {enr.fullName}
+                      </p>
+                      <p className="text-xs text-[#64748B] truncate">{enr.email}</p>
+                    </div>
+                    <span
+                      className={`shrink-0 rounded-md px-2 py-0.5 text-[10px] font-bold uppercase ${
+                        enr.status === 'active'
+                          ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                          : enr.status === 'pending'
+                            ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                            : 'bg-red-50 text-red-700 border border-red-200'
+                      }`}
+                    >
+                      {enr.status}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between text-[11px] text-[#64748B]">
+                    <span className="font-mono tabular-nums">NIM: {enr.identityNumber || '—'}</span>
+                    <span className="font-mono tabular-nums">{formatDateTime(enr.enrolledAt)}</span>
+                  </div>
+                  {canManage && (enr.status === 'pending' || enr.status === 'active') && (
+                    <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-[#E2E8F0]">
+                      {enr.status === 'pending' && (
+                        <>
+                          <Button
+                            type="button"
+                            size="sm"
+                            onClick={() =>
+                              setEnrollmentConfirm({
+                                enrollmentId: enr.id,
+                                studentName: enr.fullName,
+                                status: 'active',
+                              })
+                            }
+                          >
+                            <CheckCircle2 className="h-3.5 w-3.5" />
+                            <span>Setujui</span>
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="destructive"
+                            onClick={() =>
+                              setEnrollmentConfirm({
+                                enrollmentId: enr.id,
+                                studentName: enr.fullName,
+                                status: 'rejected',
+                              })
+                            }
+                          >
+                            <XCircle className="h-3.5 w-3.5" />
+                            <span>Tolak</span>
+                          </Button>
+                        </>
+                      )}
+                      {enr.status === 'active' && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            setEnrollmentConfirm({
+                              enrollmentId: enr.id,
+                              studentName: enr.fullName,
+                              status: 'dropped',
+                            })
+                          }
+                        >
+                          Drop Peserta
+                        </Button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {/* Desktop & Tablet Table */}
+            <div className="hidden md:block overflow-x-auto mt-4">
               <table className="w-full text-left border-collapse">
                 <thead>
-                  <tr className="border-b border-slate-200 bg-slate-50/80 text-xs font-semibold text-slate-600">
+                  <tr className="border-b border-[#E2E8F0] bg-[#F7F9FC] text-xs font-semibold text-[#64748B]">
                     <th className="py-3 px-4">Nama Mahasiswa</th>
                     <th className="py-3 px-4">NIM</th>
                     <th className="py-3 px-4">Status Enrollment</th>
@@ -1406,16 +2149,16 @@ export function ClassroomPage() {
                     )}
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-200 text-sm">
+                <tbody className="divide-y divide-[#E2E8F0] text-sm">
                   {enrollments.map((enr: any) => (
-                    <tr key={enr.id} className="hover:bg-slate-50/70">
+                    <tr key={enr.id} className="hover:bg-[#F7F9FC]/70">
                       <td className="py-3 px-4">
-                        <p className="font-semibold text-slate-900">
+                        <p className="font-semibold text-[#172033]">
                           {enr.fullName}
                         </p>
-                        <p className="text-xs text-slate-500">{enr.email}</p>
+                        <p className="text-xs text-[#64748B]">{enr.email}</p>
                       </td>
-                      <td className="py-3 px-4 font-mono text-xs tabular-nums text-slate-700">
+                      <td className="py-3 px-4 font-mono text-xs tabular-nums text-[#172033]">
                         {enr.identityNumber || '—'}
                       </td>
                       <td className="py-3 px-4 text-xs font-semibold">
@@ -1431,7 +2174,7 @@ export function ClassroomPage() {
                           {enr.status.toUpperCase()}
                         </span>
                       </td>
-                      <td className="py-3 px-4 font-mono text-xs tabular-nums text-slate-500">
+                      <td className="py-3 px-4 font-mono text-xs tabular-nums text-[#64748B]">
                         {formatDateTime(enr.enrolledAt)}
                       </td>
                       {canManage && (
@@ -1504,262 +2247,190 @@ export function ClassroomPage() {
       {activeTab === 'grades' && (
         <div className="mt-6 space-y-6">
           {/* Grade Categories Strip */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
             {(gradebook.categories || []).map((cat: any) => (
-              <Card key={cat.id} className="p-4">
-                <p className="text-xs text-slate-500">Komponen Penilaian</p>
-                <p className="mt-1 text-sm font-bold text-slate-900">
+              <Card key={cat.id} className="p-4 border-[#E2E8F0] bg-white">
+                <p className="text-xs text-[#64748B]">Komponen Penilaian</p>
+                <p className="mt-1 text-sm font-bold text-[#172033]">
                   {cat.name}
                 </p>
-                <p className="mt-1 font-mono text-lg font-bold text-amber-700 tabular-nums">
+                <p className="mt-1 font-mono text-lg font-bold text-[#2563EB] tabular-nums">
                   Bobot {cat.weightPercent}%
                 </p>
               </Card>
             ))}
-            <Card className="p-4">
-              <p className="text-xs text-slate-500">Total Item Evaluasi</p>
-              <p className="mt-1 text-sm font-bold text-slate-900">
+            <Card className="p-4 border-[#E2E8F0] bg-white">
+              <p className="text-xs text-[#64748B]">Total Item Evaluasi</p>
+              <p className="mt-1 text-sm font-bold text-[#172033]">
                 Tugas & Kuis Terdaftar
               </p>
-              <p className="mt-1 font-mono text-lg font-bold text-slate-900 tabular-nums">
+              <p className="mt-1 font-mono text-lg font-bold text-[#14213D] tabular-nums">
                 {gradebook.items?.length || 0} Item Penilaian
               </p>
             </Card>
           </div>
 
-          <Card className="p-6 overflow-x-auto">
-            <h2 className="text-base font-bold text-slate-900">
-              {canManage
+          <Card className="p-5 sm:p-6 border-[#E2E8F0] bg-white">
+            <h2 className="text-base font-bold text-[#172033]">
+              {canInspectAll
                 ? 'Matriks Buku Nilai Seluruh Mahasiswa Aktif'
                 : 'Transkrip Nilai Personal Anda pada Kelas Ini'}
             </h2>
-            <p className="text-xs text-slate-500 mt-0.5">
+            <p className="text-xs text-[#64748B] mt-0.5">
               Nilai mahasiswa dilindungi kebijakan privasi server-side: mahasiswa hanya dapat melihat nilainya sendiri.
             </p>
 
-            <table className="mt-4 w-full text-left border-collapse">
-              <thead>
-                <tr className="border-b border-slate-200 bg-slate-50/80 text-xs font-semibold text-slate-600">
-                  <th className="py-3 px-4">Mahasiswa</th>
-                  {(gradebook.items || []).map((item: any) => (
-                    <th key={item.id} className="py-3 px-4 text-right">
-                      {item.title}
-                    </th>
-                  ))}
-                  <th className="py-3 px-4 text-right">Rata-Rata Akhir</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-200 text-sm">
-                {(canManage
-                  ? activeStudents
-                  : activeStudents.filter((s: any) => s.studentId === user?.id)
-                ).map((stu: any) => {
-                  const stuRecords = (gradebook.records || []).filter(
-                    (r: any) => r.studentId === stu.studentId
-                  );
-                  const avg =
-                    stuRecords.length > 0
-                      ? (
-                          stuRecords.reduce(
-                            (acc: number, r: any) => acc + Number(r.score),
-                            0
-                          ) / stuRecords.length
-                        ).toFixed(2)
-                      : null;
+            {/* Mobile Grade Cards (< 768px) */}
+            <div className="md:hidden mt-4 space-y-3">
+              {(canInspectAll
+                ? activeStudents
+                : activeStudents.filter((s: any) => s.studentId === user?.id)
+              ).map((stu: any) => {
+                const stuRecords = (gradebook.records || []).filter(
+                  (r: any) => r.studentId === stu.studentId
+                );
+                const avg =
+                  stuRecords.length > 0
+                    ? (
+                        stuRecords.reduce(
+                          (acc: number, r: any) => acc + Number(r.score),
+                          0
+                        ) / stuRecords.length
+                      ).toFixed(2)
+                    : null;
 
-                  return (
-                    <tr key={stu.studentId} className="hover:bg-slate-50/70">
-                      <td className="py-3 px-4">
-                        <p className="font-semibold text-slate-900">
+                return (
+                  <div
+                    key={stu.studentId}
+                    className="rounded-xl border border-[#E2E8F0] bg-[#F7F9FC] p-3.5 space-y-2.5"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-[#172033] truncate">
                           {stu.fullName}
                         </p>
-                        <p className="font-mono text-xs text-slate-500 tabular-nums">
+                        <p className="font-mono text-xs text-[#64748B] tabular-nums">
                           {stu.identityNumber}
                         </p>
-                      </td>
-                      {(gradebook.items || []).map((item: any) => {
-                        const rec = stuRecords.find(
-                          (r: any) => r.gradeItemId === item.id
-                        );
-                        return (
-                          <td
-                            key={item.id}
-                            className="py-3 px-4 text-right font-mono text-xs tabular-nums"
-                          >
-                            {rec ? (
-                              <strong className="text-slate-900">
-                                {rec.score} / {item.maxScore}
-                              </strong>
-                            ) : (
-                              <span className="text-slate-400">Belum ada</span>
-                            )}
-                          </td>
-                        );
-                      })}
-                      <td className="py-3 px-4 text-right font-mono text-sm font-bold tabular-nums text-emerald-700">
-                        {avg ? `${avg}` : '—'}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <p className="text-[10px] uppercase text-[#64748B]">Rata-rata</p>
+                        <p className="font-mono text-base font-bold text-emerald-700 tabular-nums">
+                          {avg ?? '—'}
+                        </p>
+                      </div>
+                    </div>
+                    {(gradebook.items || []).length > 0 && (
+                      <div className="pt-2 border-t border-[#E2E8F0] space-y-1.5">
+                        {(gradebook.items || []).map((item: any) => {
+                          const rec = stuRecords.find(
+                            (r: any) => r.gradeItemId === item.id
+                          );
+                          return (
+                            <div
+                              key={item.id}
+                              className="flex items-center justify-between gap-2 text-xs"
+                            >
+                              <span className="text-[#64748B] truncate">{item.title}</span>
+                              <span className="font-mono tabular-nums shrink-0 font-semibold text-[#172033]">
+                                {rec ? `${rec.score} / ${item.maxScore}` : 'Belum ada'}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Desktop & Tablet Gradebook Table */}
+            <div className="hidden md:block overflow-x-auto mt-4">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-[#E2E8F0] bg-[#F7F9FC] text-xs font-semibold text-[#64748B]">
+                    <th className="py-3 px-4">Mahasiswa</th>
+                    {(gradebook.items || []).map((item: any) => (
+                      <th key={item.id} className="py-3 px-4 text-right">
+                        {item.title}
+                      </th>
+                    ))}
+                    <th className="py-3 px-4 text-right">Rata-Rata Akhir</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#E2E8F0] text-sm">
+                  {(canInspectAll
+                    ? activeStudents
+                    : activeStudents.filter((s: any) => s.studentId === user?.id)
+                  ).map((stu: any) => {
+                    const stuRecords = (gradebook.records || []).filter(
+                      (r: any) => r.studentId === stu.studentId
+                    );
+                    const avg =
+                      stuRecords.length > 0
+                        ? (
+                            stuRecords.reduce(
+                              (acc: number, r: any) => acc + Number(r.score),
+                              0
+                            ) / stuRecords.length
+                          ).toFixed(2)
+                        : null;
+
+                    return (
+                      <tr key={stu.studentId} className="hover:bg-[#F7F9FC]/70">
+                        <td className="py-3 px-4">
+                          <p className="font-semibold text-[#172033]">
+                            {stu.fullName}
+                          </p>
+                          <p className="font-mono text-xs text-[#64748B] tabular-nums">
+                            {stu.identityNumber}
+                          </p>
+                        </td>
+                        {(gradebook.items || []).map((item: any) => {
+                          const rec = stuRecords.find(
+                            (r: any) => r.gradeItemId === item.id
+                          );
+                          return (
+                            <td
+                              key={item.id}
+                              className="py-3 px-4 text-right font-mono text-xs tabular-nums"
+                            >
+                              {rec ? (
+                                <strong className="text-[#172033]">
+                                  {rec.score} / {item.maxScore}
+                                </strong>
+                              ) : (
+                                <span className="text-[#64748B]">Belum ada</span>
+                              )}
+                            </td>
+                          );
+                        })}
+                        <td className="py-3 px-4 text-right font-mono text-sm font-bold tabular-nums text-emerald-700">
+                          {avg ? `${avg}` : '—'}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           </Card>
         </div>
       )}
 
       {/* =====================================================================
-          TAB 5: SETTINGS (CLASSROOM CONFIGURATION & JOIN CODE GOVERNANCE)
+          TAB 5: ANALYTICS (INSTRUCTOR DASHBOARD)
       ===================================================================== */}
-      {activeTab === 'settings' && canManage && (
-        <div className="mt-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
-          <Card className="lg:col-span-7 p-6">
-            <h2 className="text-base font-bold text-slate-900">
-              Konfigurasi Ruang Kelas & Kapasitas
-            </h2>
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                const fd = new FormData(e.currentTarget);
-                updateSettingsMutation.mutate({
-                  name: String(fd.get('name')),
-                  section: String(fd.get('section')),
-                  roomNumber: String(fd.get('roomNumber')),
-                  scheduleText: String(fd.get('scheduleText')),
-                  capacity: Number(fd.get('capacity')),
-                  enrollmentPolicy: String(fd.get('enrollmentPolicy')),
-                });
-              }}
-              className="mt-4 space-y-4"
-            >
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Nama Ruang Kelas
-                </label>
-                <Input name="name" defaultValue={classroom.name} required />
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Seksi Kelas
-                  </label>
-                  <Input
-                    name="section"
-                    defaultValue={classroom.section}
-                    required
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Ruangan Laboratorium
-                  </label>
-                  <Input
-                    name="roomNumber"
-                    defaultValue={classroom.roomNumber}
-                    required
-                  />
-                </div>
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Jadwal Perkuliahan
-                  </label>
-                  <Input
-                    name="scheduleText"
-                    defaultValue={classroom.scheduleText}
-                    required
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Kapasitas Maksimum Kursi
-                  </label>
-                  <Input
-                    name="capacity"
-                    type="number"
-                    min={5}
-                    max={200}
-                    defaultValue={classroom.capacity}
-                    required
-                  />
-                </div>
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Kebijakan Pendaftaran Mahasiswa Baru
-                </label>
-                <select
-                  name="enrollmentPolicy"
-                  defaultValue={classroom.enrollmentPolicy}
-                  className="w-full h-10 rounded-lg border border-slate-200 bg-white px-3 text-sm"
-                >
-                  <option value="AUTO">
-                    Otomatis Aktif (AUTO) — Mahasiswa langsung aktif saat memasukkan kode
-                  </option>
-                  <option value="APPROVAL_REQUIRED">
-                    Wajib Persetujuan Dosen (APPROVAL_REQUIRED) — Status pending hingga disetujui
-                  </option>
-                </select>
-              </div>
-              <div className="pt-2">
-                <Button
-                  type="submit"
-                  disabled={updateSettingsMutation.isPending}
-                >
-                  {updateSettingsMutation.isPending
-                    ? 'Menyimpan...'
-                    : 'Simpan Pengaturan Kelas'}
-                </Button>
-              </div>
-            </form>
-          </Card>
+      {activeTab === 'analytics' && canManage && id && (
+        <InstructorAnalyticsDashboard classroomId={id} />
+      )}
 
-          <Card className="lg:col-span-5 p-6 flex flex-col justify-between">
-            <div>
-              <h2 className="text-base font-bold text-slate-900">
-                Manajemen Kode Gabung Kelas (Join Code)
-              </h2>
-              <p className="mt-1 text-xs text-slate-600">
-                Kode gabung kelas bersifat unik dan dapat diperbarui atau dicabut kapan saja untuk mencegah pendaftaran tanpa izin.
-              </p>
-
-              <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-4">
-                <p className="text-xs text-slate-500">Kode Aktif Saat Ini</p>
-                <p className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">
-                  {activeJoinCode || 'TIDAK ADA (DICABUT)'}
-                </p>
-              </div>
-
-              <div className="mt-4 space-y-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="w-full justify-start"
-                  onClick={() => setJoinCodeConfirm('regenerate')}
-                >
-                  <RefreshCw className="h-4 w-4" />
-                  <span>Buat Ulang (Regenerate) Kode Kelas Baru</span>
-                </Button>
-                {activeJoinCode && (
-                  <Button
-                    type="button"
-                    variant="destructive"
-                    className="w-full justify-start"
-                    onClick={() => setJoinCodeConfirm('revoke')}
-                  >
-                    <XCircle className="h-4 w-4" />
-                    <span>Cabut (Revoke) Kode Kelas Aktif</span>
-                  </Button>
-                )}
-              </div>
-            </div>
-
-            <div className="mt-6 pt-4 border-t border-slate-100 text-xs text-slate-500">
-              Riwayat Kode Kelas ({joinCodes.length} tercatat di PostgreSQL)
-            </div>
-          </Card>
-        </div>
+      {/* =====================================================================
+          TAB 6: SETTINGS (ADVANCED CLASSROOM SETTINGS CENTER)
+      ===================================================================== */}
+      {activeTab === 'settings' && canManage && id && (
+        <ClassroomSettingsCenter classroomId={id} />
       )}
 
       {/* =====================================================================
@@ -2242,6 +2913,79 @@ export function ClassroomPage() {
         variant={joinCodeConfirm === 'revoke' ? 'destructive' : 'default'}
         isLoading={updateSettingsMutation.isPending}
       />
+
+      {/* Edit Module Modal */}
+      <ModalDialog
+        open={Boolean(editingModule)}
+        onClose={() => setEditingModule(null)}
+        title="Edit Modul Pembelajaran"
+      >
+        {editingModule && (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Judul Modul
+              </label>
+              <Input
+                value={editingModule.title}
+                onChange={(e) =>
+                  setEditingModule({ ...editingModule, title: e.target.value })
+                }
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Deskripsi Modul
+              </label>
+              <Textarea
+                rows={3}
+                value={editingModule.description}
+                onChange={(e) =>
+                  setEditingModule({ ...editingModule, description: e.target.value })
+                }
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Status Publikasi
+              </label>
+              <select
+                value={editingModule.status}
+                onChange={(e) =>
+                  setEditingModule({ ...editingModule, status: e.target.value })
+                }
+                className="w-full h-9 rounded-lg border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700"
+              >
+                <option value="PUBLISHED">PUBLISHED (Tampil ke Mahasiswa)</option>
+                <option value="DRAFT">DRAFT (Disembunyikan)</option>
+                <option value="ARCHIVED">ARCHIVED (Diarsipkan)</option>
+              </select>
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <Button variant="outline" onClick={() => setEditingModule(null)}>
+                Batal
+              </Button>
+              <Button
+                disabled={updateModuleMutation.isPending || !editingModule.title.trim()}
+                onClick={() =>
+                  updateModuleMutation.mutate({
+                    moduleId: editingModule.id,
+                    data: {
+                      title: editingModule.title.trim(),
+                      description: editingModule.description,
+                      status: editingModule.status,
+                    },
+                  })
+                }
+              >
+                {updateModuleMutation.isPending ? 'Menyimpan...' : 'Simpan Perubahan'}
+              </Button>
+            </div>
+          </div>
+        )}
+      </ModalDialog>
+
+      <ConfirmDialog {...deleteConfirm.dialogProps} />
     </AppShell>
   );
 }

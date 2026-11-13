@@ -9,6 +9,7 @@ import {
   jsonb,
   uniqueIndex,
   index,
+  primaryKey,
 } from 'drizzle-orm/pg-core';
 
 // 1. Users & Profiles
@@ -22,6 +23,13 @@ export const users = pgTable(
     fullName: text('full_name').notNull(),
     identityNumber: text('identity_number').unique(),
     isActive: boolean('is_active').default(true).notNull(),
+    accountStatus: text('account_status').default('ACTIVE').notNull(), // 'ACTIVE' | 'INACTIVE' | 'SUSPENDED' | 'PENDING_ACTIVATION'
+    mustResetPassword: boolean('must_reset_password').default(false).notNull(),
+    passwordChangedAt: timestamp('password_changed_at', { withTimezone: true }),
+    temporaryPasswordExpiresAt: timestamp('temporary_password_expires_at', { withTimezone: true }),
+    passwordResetAt: timestamp('password_reset_at', { withTimezone: true }),
+    passwordResetBy: uuid('password_reset_by'),
+    passwordResetReason: text('password_reset_reason'),
     lastLoginAt: timestamp('last_login_at'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
@@ -41,11 +49,19 @@ export const userProfiles = pgTable(
       .notNull()
       .unique(),
     studyProgram: text('study_program').default('Teknik Informatika').notNull(),
+    organizationalUnit: text('organizational_unit').default('Politeknik Kampar').notNull(),
+    nidn: text('nidn'),
+    nip: text('nip'),
+    nim: text('nim'),
+    academicStatus: text('academic_status').default('AKTIF').notNull(),
+    admissionYear: integer('admission_year'),
+    auditScope: text('audit_scope'),
     phone: text('phone'),
     bio: text('bio'),
     avatarUrl: text('avatar_url'),
     semesterLevel: integer('semester_level'),
     academicTitle: text('academic_title'),
+    dashboardPreferences: jsonb('dashboard_preferences').default({}).notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
   },
   (table) => [index('idx_user_profiles_user_id').on(table.userId)]
@@ -130,21 +146,22 @@ export const semesters = pgTable(
   (table) => [index('idx_semesters_academic_year').on(table.academicYearId)]
 );
 
-// 3.1 Dedicated Superadmin-Managed Academic Periods & Academic Calendar
+// 3.1 Dedicated Superadmin-Managed Academic Periods (Pure Semester Administration)
 export const academicPeriods = pgTable(
   'academic_periods',
   {
     id: uuid('id').defaultRandom().primaryKey(),
-    code: text('code').notNull().unique(), // e.g. '20261'
+    code: text('code').notNull().unique(), // academic_code e.g. '20261'
     name: text('name').notNull(), // e.g. 'Semester Ganjil 2026/2027'
     academicYear: text('academic_year').notNull(), // e.g. '2026/2027'
-    semesterType: text('semester_type').notNull(), // 'Ganjil' | 'Genap' | 'Pendek'
-    startDate: timestamp('start_date', { withTimezone: true }).notNull(),
-    endDate: timestamp('end_date', { withTimezone: true }).notNull(),
-    registrationStart: timestamp('registration_start', { withTimezone: true }).notNull(),
-    registrationEnd: timestamp('registration_end', { withTimezone: true }).notNull(),
-    status: text('status').default('draft').notNull(), // 'draft' | 'scheduled' | 'active' | 'registration_closed' | 'completed' | 'archived'
+    semesterType: text('semester_type').notNull(), // 'ODD' | 'EVEN' | 'SHORT'
+    description: text('description').default('').notNull(),
+    preparationStartDate: timestamp('preparation_start_date', { withTimezone: true }),
+    startDate: timestamp('start_date', { withTimezone: true }).notNull(), // lecture_start_date
+    endDate: timestamp('end_date', { withTimezone: true }).notNull(), // lecture_end_date
+    status: text('status').default('DRAFT').notNull(), // 'DRAFT' | 'SCHEDULED' | 'ACTIVE' | 'COMPLETED' | 'ARCHIVED'
     isDefault: boolean('is_default').default(false).notNull(),
+    administrativeNotes: text('administrative_notes').default('').notNull(),
     createdById: uuid('created_by_id').references(() => users.id, {
       onDelete: 'set null',
     }),
@@ -286,12 +303,12 @@ export const classrooms = pgTable(
   'classrooms',
   {
     id: uuid('id').defaultRandom().primaryKey(),
-    courseId: uuid('course_id')
-      .references(() => courses.id, { onDelete: 'restrict' })
-      .notNull(),
-    semesterId: uuid('semester_id')
-      .references(() => semesters.id, { onDelete: 'restrict' })
-      .notNull(),
+    courseId: uuid('course_id').references(() => courses.id, {
+      onDelete: 'set null',
+    }),
+    semesterId: uuid('semester_id').references(() => semesters.id, {
+      onDelete: 'set null',
+    }),
     courseOfferingId: uuid('course_offering_id').references(
       () => courseOfferings.id,
       { onDelete: 'set null' }
@@ -303,6 +320,11 @@ export const classrooms = pgTable(
     name: text('name').notNull(),
     section: text('section').notNull(),
     classroomCode: text('classroom_code'),
+    subjectName: text('subject_name'),
+    subjectCode: text('subject_code'),
+    academicYear: text('academic_year'),
+    semesterName: text('semester_name'),
+    locationDescription: text('location_description'),
     cohort: text('cohort'),
     classroomType: text('classroom_type').default('REGULAR').notNull(), // 'REGULAR' | 'PRACTICUM' | 'REMEDIAL' | 'SHORT_SEMESTER'
     roomNumber: text('room_number').default('Lab Komputer Lantai 2').notNull(),
@@ -314,13 +336,45 @@ export const classrooms = pgTable(
     language: text('language').default('id').notNull(),
     visibility: text('visibility').default('PUBLIC_ENROLLED').notNull(),
     learningObjectives: text('learning_objectives'),
+    cpmk: text('cpmk'),
     coverImageKey: text('cover_image_key'),
+    coverImagePath: text('cover_image_path'),
+    coverThumbnailPath: text('cover_thumbnail_path'),
+    coverMimeType: text('cover_mime_type'),
+    coverFileSize: integer('cover_file_size'),
+    coverWidth: integer('cover_width'),
+    coverHeight: integer('cover_height'),
+    coverUpdatedAt: timestamp('cover_updated_at', { withTimezone: true }),
     enrollmentPolicy: text('enrollment_policy').default('AUTO').notNull(), // 'AUTO' | 'APPROVAL_REQUIRED' | 'INVITATION_ONLY' | 'JOIN_CODE' | 'ADMIN_ASSIGNMENT' | 'RESTRICTED'
     status: text('status').default('ACTIVE').notNull(),
     lifecycleStatus: text('lifecycle_status').default('active').notNull(), // 'draft' | 'pending_approval' | 'scheduled' | 'published' | 'active' | 'enrollment_closed' | 'completed' | 'archived' | 'cancelled'
     approvalStatus: text('approval_status').default('APPROVED').notNull(), // 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' | 'REJECTED'
     bannerTheme: text('banner_theme').default('slate').notNull(),
     description: text('description'),
+    privacyConfig: jsonb('privacy_config')
+      .default({
+        discoverability: 'ENROLLED_ONLY',
+        enrollmentVisibility: 'INSTRUCTORS_ONLY',
+        studentRosterVisibility: 'CLASSMATES',
+        contentVisibility: 'ENROLLED_ONLY',
+        restrictJoinCode: false,
+        requireApprovalForWaitlist: true,
+      })
+      .notNull(),
+    notificationConfig: jsonb('notification_config')
+      .default({
+        onNewEnrollment: true,
+        onEnrollmentRequest: true,
+        onAssignmentSubmission: true,
+        onLateSubmission: true,
+        onMaterialCompletion: false,
+        onAssessmentCompletion: true,
+        onNewComment: true,
+        onNewAnnouncement: true,
+        inAppEnabled: true,
+        emailEnabled: false,
+      })
+      .notNull(),
     createdById: uuid('created_by_id')
       .references(() => users.id, { onDelete: 'restrict' })
       .notNull(),
@@ -391,6 +445,7 @@ export const classroomSchedules = pgTable(
     }),
     meetingType: text('meeting_type').default('OFFLINE').notNull(), // 'OFFLINE' | 'ONLINE_ZOOM' | 'ONLINE_MEET' | 'HYBRID'
     onlineLink: text('online_link'),
+    locationDescription: text('location_description'),
     exceptions: jsonb('exceptions').default([]).notNull(), // Array of exception objects { date: string, type: 'RESCHEDULED' | 'CANCELLED', reason: string, rescheduledStartTime?: string, rescheduledEndTime?: string }
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
@@ -573,7 +628,7 @@ export const classroomEvents = pgTable(
   (table) => [index('idx_classroom_events_classroom').on(table.classroomId)]
 );
 
-// 6. Classroom Topics, Advanced Learning Materials, Attachments, Videos, Progress & Revisions
+// 6. Classroom Topics (Modules), Advanced Learning Materials, Attachments, Videos, Progress & Revisions
 export const classroomTopics = pgTable(
   'classroom_topics',
   {
@@ -584,10 +639,20 @@ export const classroomTopics = pgTable(
     title: text('title').notNull(),
     description: text('description'),
     sortOrder: integer('sort_order').default(1).notNull(),
+    status: text('status').default('PUBLISHED').notNull(), // 'PUBLISHED' | 'DRAFT' | 'ARCHIVED'
+    createdBy: uuid('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    updatedBy: uuid('updated_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
     createdAt: timestamp('created_at').defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [index('idx_topics_classroom').on(table.classroomId)]
 );
+
+export const classroomModules = classroomTopics;
 
 export const storedFiles = pgTable(
   'stored_files',
@@ -726,6 +791,9 @@ export const materialProgress = pgTable(
     studentId: uuid('student_id')
       .references(() => users.id, { onDelete: 'cascade' })
       .notNull(),
+    classroomId: uuid('classroom_id').references(() => classrooms.id, {
+      onDelete: 'cascade',
+    }),
     progressPercent: integer('progress_percent').default(0).notNull(),
     lastPosition: jsonb('last_position').default({}).notNull(),
     status: text('status').default('NOT_STARTED').notNull(), // 'NOT_STARTED' | 'IN_PROGRESS' | 'COMPLETED'
@@ -739,6 +807,130 @@ export const materialProgress = pgTable(
     ),
     index('idx_material_progress_material').on(table.materialId),
     index('idx_material_progress_student').on(table.studentId),
+    index('idx_material_progress_classroom').on(table.classroomId),
+  ]
+);
+
+export const classroomMaterialBookmarks = pgTable(
+  'classroom_material_bookmarks',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    studentId: uuid('student_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    materialId: uuid('material_id')
+      .references(() => learningMaterials.id, { onDelete: 'cascade' })
+      .notNull(),
+    classroomId: uuid('classroom_id')
+      .references(() => classrooms.id, { onDelete: 'cascade' })
+      .notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('uq_material_bookmark').on(table.studentId, table.materialId),
+    index('idx_material_bookmarks_classroom').on(table.classroomId),
+    index('idx_material_bookmarks_student').on(table.studentId),
+  ]
+);
+
+export const classroomMaterialNotes = pgTable(
+  'classroom_material_notes',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    studentId: uuid('student_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    materialId: uuid('material_id')
+      .references(() => learningMaterials.id, { onDelete: 'cascade' })
+      .notNull(),
+    classroomId: uuid('classroom_id')
+      .references(() => classrooms.id, { onDelete: 'cascade' })
+      .notNull(),
+    content: text('content').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('uq_material_notes').on(table.studentId, table.materialId),
+    index('idx_material_notes_classroom').on(table.classroomId),
+    index('idx_material_notes_student').on(table.studentId),
+  ]
+);
+
+export const classroomMaterialViews = pgTable(
+  'classroom_material_views',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    studentId: uuid('student_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    materialId: uuid('material_id')
+      .references(() => learningMaterials.id, { onDelete: 'cascade' })
+      .notNull(),
+    classroomId: uuid('classroom_id')
+      .references(() => classrooms.id, { onDelete: 'cascade' })
+      .notNull(),
+    firstOpenedAt: timestamp('first_opened_at', { withTimezone: true }).defaultNow().notNull(),
+    lastOpenedAt: timestamp('last_opened_at', { withTimezone: true }).defaultNow().notNull(),
+    viewCount: integer('view_count').default(1).notNull(),
+  },
+  (table) => [
+    uniqueIndex('uq_material_views').on(table.studentId, table.materialId),
+    index('idx_material_views_classroom').on(table.classroomId),
+    index('idx_material_views_student').on(table.studentId),
+  ]
+);
+
+export const classroomAuditLogs = pgTable(
+  'classroom_audit_logs',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    classroomId: uuid('classroom_id')
+      .references(() => classrooms.id, { onDelete: 'cascade' })
+      .notNull(),
+    actorId: uuid('actor_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    actorRole: text('actor_role').default('INSTRUCTOR').notNull(),
+    resourceType: text('resource_type').notNull(), // 'MODULE' | 'MATERIAL' | 'ASSIGNMENT' | 'ASSESSMENT' | 'CLASSROOM'
+    resourceId: text('resource_id'),
+    resourceTitle: text('resource_title').notNull(),
+    action: text('action').notNull(), // 'CREATED' | 'UPDATED' | 'DELETED' | 'PUBLISHED' | 'UNPUBLISHED' | 'ARCHIVED' | 'RESTORED' | 'REORDERED' | 'DUPLICATED'
+    beforeValue: jsonb('before_value'),
+    afterValue: jsonb('after_value'),
+    changeSummary: text('change_summary').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_classroom_audit_classroom').on(table.classroomId),
+    index('idx_classroom_audit_created').on(table.createdAt),
+    index('idx_classroom_audit_resource').on(table.resourceType),
+    index('idx_classroom_audit_action').on(table.action),
+  ]
+);
+
+export const classroomResourceVersions = pgTable(
+  'classroom_resource_versions',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    classroomId: uuid('classroom_id')
+      .references(() => classrooms.id, { onDelete: 'cascade' })
+      .notNull(),
+    resourceType: text('resource_type').notNull(), // 'MATERIAL' | 'ASSIGNMENT' | 'ASSESSMENT'
+    resourceId: uuid('resource_id').notNull(),
+    versionNumber: integer('version_number').default(1).notNull(),
+    title: text('title').notNull(),
+    contentJson: jsonb('content_json'),
+    contentHtml: text('content_html'),
+    createdById: uuid('created_by_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    changeNotes: text('change_notes'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_resource_versions_resource').on(table.resourceId),
+    index('idx_resource_versions_classroom').on(table.classroomId),
   ]
 );
 
@@ -1478,6 +1670,38 @@ export const userSessions = pgTable(
   ]
 );
 
+// 11b. Impersonation Sessions (Account Switching by Superadmin)
+export const impersonationSessions = pgTable(
+  'impersonation_sessions',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    sessionId: uuid('session_id')
+      .references(() => userSessions.id, { onDelete: 'cascade' })
+      .notNull(),
+    originalUserId: uuid('original_user_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    impersonatedUserId: uuid('impersonated_user_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    originalRole: text('original_role').notNull(),
+    impersonatedRole: text('impersonated_role').notNull(),
+    reason: text('reason'),
+    ipAddress: text('ip_address'),
+    userAgent: text('user_agent'),
+    isActive: boolean('is_active').default(true).notNull(),
+    startedAt: timestamp('started_at').defaultNow().notNull(),
+    expiresAt: timestamp('expires_at').notNull(),
+    endedAt: timestamp('ended_at'),
+    endReason: text('end_reason'),
+  },
+  (table) => [
+    index('idx_impersonation_session_id').on(table.sessionId),
+    index('idx_impersonation_original_user').on(table.originalUserId),
+    index('idx_impersonation_target_user').on(table.impersonatedUserId),
+  ]
+);
+
 // 12. Notifications & Audit Logs
 export const notifications = pgTable(
   'notifications',
@@ -1666,6 +1890,13 @@ export const questions = pgTable(
     usageCount: integer('usage_count').default(0).notNull(),
     versionHistory: jsonb('version_history').default([]).notNull(),
     usageHistory: jsonb('usage_history').default([]).notNull(),
+    title: text('title').default('').notNull(),
+    questionCode: text('question_code'),
+    status: text('status').default('READY').notNull(), // 'DRAFT' | 'READY' | 'ARCHIVED'
+    sourceType: text('source_type').default('EDITOR').notNull(), // 'EDITOR' | 'IMPORT_XLSX' | 'IMPORT_CSV' | 'DUPLICATED'
+    externalQuestionId: text('external_question_id'),
+    importJobId: uuid('import_job_id'),
+    tags: jsonb('tags').default([]).notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },
@@ -1689,6 +1920,7 @@ export const questionOptions = pgTable(
     optionText: text('option_text').notNull(),
     optionJson: jsonb('option_json'),
     imageObjectKey: text('image_object_key'),
+    audioObjectKey: text('audio_object_key'),
     matchRightText: text('match_right_text'),
     correctOrderIndex: integer('correct_order_index'),
     isCorrect: boolean('is_correct').default(false).notNull(),
@@ -1718,6 +1950,15 @@ export const questionMedia = pgTable(
     fileSize: integer('file_size').default(0).notNull(),
     caption: text('caption').default('').notNull(),
     sortOrder: integer('sort_order').default(1).notNull(),
+    durationSeconds: integer('duration_seconds'),
+    width: integer('width'),
+    height: integer('height'),
+    thumbnailKey: text('thumbnail_key'),
+    optimizedFilename: text('optimized_filename'),
+    uploadedById: uuid('uploaded_by_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    optionId: uuid('option_id'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [index('idx_question_media_question').on(table.questionId)]
@@ -1807,6 +2048,8 @@ export const assessmentQuestions = pgTable(
     }),
     sortOrder: integer('sort_order').default(1).notNull(),
     isRequired: boolean('is_required').default(true).notNull(),
+    questionSnapshot: jsonb('question_snapshot'),
+    sourceVersionNumber: integer('source_version_number').default(1).notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
@@ -2201,4 +2444,321 @@ export const assessmentEvents = pgTable(
     index('idx_assessment_events_attempt').on(table.attemptId),
   ]
 );
+
+export const questionImportJobs = pgTable(
+  'question_import_jobs',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    classroomId: uuid('classroom_id').references(() => classrooms.id, {
+      onDelete: 'cascade',
+    }),
+    assessmentId: uuid('assessment_id').references(() => assessments.id, {
+      onDelete: 'set null',
+    }),
+    uploadedById: uuid('uploaded_by_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    filename: text('filename').notNull(),
+    fileFormat: text('file_format').notNull(), // 'XLSX' | 'CSV'
+    importMode: text('import_mode').default('SKIP_DUPLICATES').notNull(),
+    fingerprint: text('fingerprint').notNull(),
+    status: text('status').default('PENDING').notNull(), // 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
+    batchSize: integer('batch_size').default(100).notNull(),
+    totalRows: integer('total_rows').default(0).notNull(),
+    processedRows: integer('processed_rows').default(0).notNull(),
+    successfulRows: integer('successful_rows').default(0).notNull(),
+    failedRows: integer('failed_rows').default(0).notNull(),
+    skippedRows: integer('skipped_rows').default(0).notNull(),
+    payloadRows: jsonb('payload_rows').default([]).notNull(),
+    errorReport: jsonb('error_report').default([]).notNull(),
+    summary: jsonb('summary').default({}).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+  },
+  (table) => [
+    index('idx_question_import_jobs_classroom').on(table.classroomId),
+    index('idx_question_import_jobs_user').on(table.uploadedById),
+    index('idx_question_import_jobs_fingerprint').on(table.fingerprint),
+  ]
+);
+
+export const questionImportErrors = pgTable(
+  'question_import_errors',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    jobId: uuid('job_id')
+      .references(() => questionImportJobs.id, { onDelete: 'cascade' })
+      .notNull(),
+    rowNumber: integer('row_number').notNull(),
+    externalQuestionId: text('external_question_id').default('').notNull(),
+    field: text('field').default('').notNull(),
+    errorMessage: text('error_message').notNull(),
+    rawRow: jsonb('raw_row').default({}).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [index('idx_question_import_errors_job').on(table.jobId)]
+);
+
+// 18. Password Reset Tokens & Bulk User Import Batches (Academic Identity & User Administration Center)
+export const passwordResetTokens = pgTable(
+  'password_reset_tokens',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    userId: uuid('user_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    tokenHash: text('token_hash').notNull().unique(),
+    requestedById: uuid('requested_by_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    mode: text('mode').default('INVITATION_LINK').notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    usedAt: timestamp('used_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_password_reset_tokens_user').on(table.userId),
+    index('idx_password_reset_tokens_hash').on(table.tokenHash),
+  ]
+);
+
+export const userImportBatches = pgTable(
+  'user_import_batches',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    originalFilename: text('original_filename').notNull(),
+    importType: text('import_type').notNull(), // 'DOSEN' | 'MAHASISWA' | 'GENERAL'
+    importMode: text('import_mode').default('SKIP_DUPLICATES').notNull(), // 'CREATE_ONLY' | 'UPSERT' | 'SKIP_DUPLICATES'
+    operatorId: uuid('operator_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    totalRecords: integer('total_records').default(0).notNull(),
+    successfulRecords: integer('successful_records').default(0).notNull(),
+    failedRecords: integer('failed_records').default(0).notNull(),
+    skippedRecords: integer('skipped_records').default(0).notNull(),
+    status: text('status').default('COMPLETED').notNull(), // 'COMPLETED' | 'PARTIAL' | 'FAILED'
+    errorReportJson: jsonb('error_report_json').default([]).notNull(),
+    fingerprint: text('fingerprint').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_user_import_batches_operator').on(table.operatorId),
+    index('idx_user_import_batches_fingerprint').on(table.fingerprint),
+  ]
+);
+
+export const passwordHistory = pgTable(
+  'password_history',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    userId: uuid('user_id')
+      .references(() => users.id, { onDelete: 'cascade' })
+      .notNull(),
+    passwordHash: text('password_hash').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [index('idx_password_history_user').on(table.userId)]
+);
+
+// 19. System Settings, Application Themes & Settings History
+export const systemSettings = pgTable(
+  'system_settings',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    settingGroup: text('setting_group').notNull(), // 'identity' | 'branding' | 'favicon' | 'seo' | 'general'
+    settingKey: text('setting_key').notNull().unique(),
+    settingValue: text('setting_value'),
+    valueType: text('value_type').default('string').notNull(), // 'string' | 'number' | 'boolean' | 'json' | 'url'
+    isPublic: boolean('is_public').default(true).notNull(),
+    updatedBy: uuid('updated_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_system_settings_group').on(table.settingGroup),
+    index('idx_system_settings_key').on(table.settingKey),
+  ]
+);
+
+export const applicationThemes = pgTable(
+  'application_themes',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    presetKey: text('preset_key').notNull().unique(),
+    presetName: text('preset_name').notNull(),
+    description: text('description').default('').notNull(),
+    tokenConfiguration: jsonb('token_configuration')
+      .$type<Record<string, string>>()
+      .notNull(),
+    isActive: boolean('is_active').default(false).notNull(),
+    updatedBy: uuid('updated_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [index('idx_application_themes_active').on(table.isActive)]
+);
+
+export const systemSettingsHistory = pgTable(
+  'system_settings_history',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    settingGroup: text('setting_group').notNull(),
+    settingKey: text('setting_key').notNull(),
+    previousValue: text('previous_value'),
+    newValue: text('new_value'),
+    changedBy: uuid('changed_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    changedAt: timestamp('changed_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_system_settings_history_group').on(table.settingGroup),
+    index('idx_system_settings_history_changed_at').on(table.changedAt),
+  ]
+);
+
+// 20. EduCoreLMS Knowledge Center & Documentation CMS
+export const knowledgeCategories = pgTable(
+  'knowledge_categories',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    name: text('name').notNull(),
+    slug: text('slug').notNull().unique(),
+    description: text('description').default('').notNull(),
+    icon: text('icon').default('BookOpen').notNull(),
+    sortOrder: integer('sort_order').default(0).notNull(),
+    isActive: boolean('is_active').default(true).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [index('idx_knowledge_categories_sort').on(table.sortOrder)]
+);
+
+export const knowledgeArticles = pgTable(
+  'knowledge_articles',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    categoryId: uuid('category_id')
+      .references(() => knowledgeCategories.id, { onDelete: 'cascade' })
+      .notNull(),
+    title: text('title').notNull(),
+    slug: text('slug').notNull().unique(),
+    excerpt: text('excerpt').default('').notNull(),
+    content: text('content').default('').notNull(),
+    contentJson: jsonb('content_json').$type<Record<string, any>>(),
+    status: text('status').default('DRAFT').notNull(), // 'DRAFT' | 'PUBLISHED' | 'ARCHIVED'
+    difficulty: text('difficulty').default('PEMULA').notNull(), // 'PEMULA' | 'MENENGAH' | 'LANJUTAN'
+    estimatedReadingMinutes: integer('estimated_reading_minutes').default(5).notNull(),
+    featuredImage: text('featured_image'),
+    isFeatured: boolean('is_featured').default(false).notNull(),
+    keywords: text('keywords').default('').notNull(),
+    relatedArticleIds: jsonb('related_article_ids').$type<string[]>().default([]).notNull(),
+    version: integer('version').default(1).notNull(),
+    docVersionLabel: text('doc_version_label').default('v1.0.0').notNull(),
+    viewCount: integer('view_count').default(0).notNull(),
+    helpfulCount: integer('helpful_count').default(0).notNull(),
+    notHelpfulCount: integer('not_helpful_count').default(0).notNull(),
+    createdBy: uuid('created_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    updatedBy: uuid('updated_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    publishedAt: timestamp('published_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_knowledge_articles_category').on(table.categoryId),
+    index('idx_knowledge_articles_status').on(table.status),
+    index('idx_knowledge_articles_featured').on(table.isFeatured),
+  ]
+);
+
+export const knowledgeArticleRoles = pgTable(
+  'knowledge_article_roles',
+  {
+    articleId: uuid('article_id')
+      .references(() => knowledgeArticles.id, { onDelete: 'cascade' })
+      .notNull(),
+    roleId: uuid('role_id')
+      .references(() => roles.id, { onDelete: 'cascade' })
+      .notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.articleId, table.roleId] }),
+    index('idx_knowledge_article_roles_role').on(table.roleId),
+  ]
+);
+
+export const knowledgeTags = pgTable('knowledge_tags', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  name: text('name').notNull(),
+  slug: text('slug').notNull().unique(),
+});
+
+export const knowledgeArticleTags = pgTable(
+  'knowledge_article_tags',
+  {
+    articleId: uuid('article_id')
+      .references(() => knowledgeArticles.id, { onDelete: 'cascade' })
+      .notNull(),
+    tagId: uuid('tag_id')
+      .references(() => knowledgeTags.id, { onDelete: 'cascade' })
+      .notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.articleId, table.tagId] }),
+    index('idx_knowledge_article_tags_tag').on(table.tagId),
+  ]
+);
+
+export const knowledgeFaqs = pgTable(
+  'knowledge_faqs',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    question: text('question').notNull(),
+    answer: text('answer').notNull(),
+    categoryId: uuid('category_id').references(() => knowledgeCategories.id, {
+      onDelete: 'set null',
+    }),
+    audienceRole: text('audience_role').default('ALL').notNull(), // 'ALL' | 'SUPERADMIN' | 'DOSEN' | 'MAHASISWA' | 'AUDITOR'
+    status: text('status').default('PUBLISHED').notNull(), // 'DRAFT' | 'PUBLISHED' | 'ARCHIVED'
+    sortOrder: integer('sort_order').default(0).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [index('idx_knowledge_faqs_category').on(table.categoryId)]
+);
+
+export const knowledgeArticleVersions = pgTable(
+  'knowledge_article_versions',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    articleId: uuid('article_id')
+      .references(() => knowledgeArticles.id, { onDelete: 'cascade' })
+      .notNull(),
+    version: integer('version').notNull(),
+    contentSnapshot: jsonb('content_snapshot')
+      .$type<Record<string, any>>()
+      .notNull(),
+    changedBy: uuid('changed_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    changeSummary: text('change_summary').default('').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('idx_knowledge_article_versions_article').on(table.articleId),
+  ]
+);
+
+
+
+
 

@@ -1,20 +1,26 @@
 import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import {
+  Activity,
   ArrowDown,
   ArrowLeft,
   ArrowUp,
+  BarChart3,
   BookOpen,
   CheckCircle2,
   Copy,
   Database,
   Eye,
+  FileSpreadsheet,
+  History,
   Layers,
+  Monitor,
   Plus,
   Save,
   Send,
   Settings,
   Shuffle,
+  Smartphone,
   Trash2,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
@@ -23,8 +29,24 @@ import {
   TiptapReadOnlyRenderer,
 } from '../components/TiptapMaterialEditor';
 import { toast } from 'sonner';
+import { QuestionRepositoryPanel } from '../components/assessment/QuestionRepositoryPanel';
+import { QuestionImportCenterPanel } from '../components/assessment/QuestionImportCenterPanel';
+import {
+  QuestionMediaUploader,
+  UploadedQuestionMedia,
+} from '../components/assessment/QuestionMediaUploader';
+import {
+  AssessmentMonitoringSummaryPanel,
+  AssessmentGradingAnalyticsPanel,
+  AssessmentHistoryPanel,
+} from '../components/assessment/AssessmentAnalyticsHistoryPanel';
+import { AddQuestionModal } from '../components/assessment/AddQuestionModal';
+import { QuestionNavigatorPanel } from '../components/assessment/QuestionNavigatorPanel';
+import { QuestionPropertiesPanel } from '../components/assessment/QuestionPropertiesPanel';
+import { ConfirmDialog, ModalDialog } from '../components/ui/primitives';
+import { useDeleteConfirmation } from '../hooks/useDeleteConfirmation';
 
-type BuilderTab = 'general' | 'questions' | 'bank' | 'settings' | 'preview';
+type BuilderTab = 'general' | 'questions' | 'settings' | 'preview' | 'publish';
 
 const OBJECTIVE_TYPES = [
   { value: 'SINGLE_CHOICE', label: 'Pilihan Ganda Tunggal (Single Choice)' },
@@ -57,6 +79,15 @@ export const AssessmentBuilderPage: React.FC = () => {
   const isEditing = Boolean(assessmentId);
 
   const [activeTab, setActiveTab] = useState<BuilderTab>('general');
+  const [previewViewport, setPreviewViewport] = useState<'desktop' | 'mobile'>('desktop');
+  const [selectedQuestionIndex, setSelectedQuestionIndex] = useState<number>(0);
+  const [leftCollapsed, setLeftCollapsed] = useState(false);
+  const [rightCollapsed, setRightCollapsed] = useState(false);
+  const [addModalOpen, setAddModalOpen] = useState(false);
+  const [repoModalOpen, setRepoModalOpen] = useState(false);
+  const [importModalOpen, setImportModalOpen] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'unsaved' | 'saving' | 'saved' | 'error'>('idle');
+  const deleteConfirm = useDeleteConfirmation<{ idx: number }>();
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
@@ -524,12 +555,64 @@ export const AssessmentBuilderPage: React.FC = () => {
     }
   };
 
+  // Track unsaved changes & debounced autosave for existing assessments
+  useEffect(() => {
+    if (loading) return;
+    setSaveStatus('unsaved');
+    if (!isEditing || !assessmentId || !title.trim()) return;
+    const timer = setTimeout(async () => {
+      setSaveStatus('saving');
+      try {
+        await apiFetch(`/api/v1/assessments/${assessmentId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            topicId: topicId || null,
+            title: title.trim(),
+            description: description.trim(),
+            category,
+            assessmentMode,
+            instructions: instructions.trim() || description.trim(),
+            instructionsJson,
+            maxScore: Number(maxScore),
+            passingGrade: Number(passingGrade),
+            estimatedDurationMinutes: Number(estimatedDurationMinutes),
+            durationMinutes: Number(durationMinutes),
+            maxAttempts: Number(maxAttempts),
+            startDate: startDate || null,
+            endDate: endDate || null,
+            lateAttemptPolicy,
+            latePenaltyPercent: Number(latePenaltyPercent),
+            settingsConfig,
+            status,
+            sections,
+          }),
+        });
+        setSaveStatus('saved');
+      } catch {
+        setSaveStatus('error');
+      }
+    }, 2500);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [title, description, category, assessmentMode, maxScore, durationMinutes, settingsConfig]);
+
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (saveStatus === 'unsaved') {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [saveStatus]);
+
   if (loading) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
-        <div className="flex items-center gap-3 text-slate-700 font-medium text-sm">
-          <div className="w-5 h-5 border-2 border-amber-600 border-t-transparent rounded-full animate-spin" />
-          Memuat Workspace Advanced Assessment & Examination Builder...
+      <div className="min-h-screen bg-[#F7F9FC] flex items-center justify-center">
+        <div className="flex items-center gap-3 text-[#172033] font-medium text-sm">
+          <div className="w-5 h-5 border-2 border-[#2563EB] border-t-transparent rounded-full animate-spin" />
+          Memuat Workspace Evaluasi Akademik...
         </div>
       </div>
     );
@@ -544,76 +627,97 @@ export const AssessmentBuilderPage: React.FC = () => {
     );
 
   return (
-    <div className="min-h-screen bg-[#F8FAFC] text-slate-900 pb-20">
-      {/* Top Bar */}
-      <header className="sticky top-0 z-30 bg-white border-b border-slate-200">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-6">
+    <div className="min-h-screen bg-[#F7F9FC] text-[#172033] pb-16">
+      {/* Compact Sticky Academic Header */}
+      <header className="sticky top-0 z-30 bg-white border-b border-[#E2E8F0]">
+        <div className="max-w-[1440px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3 min-w-0">
             <button
               type="button"
               onClick={() => navigate(`/classrooms/${classroomId}`)}
-              className="p-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-100 shrink-0"
+              className="p-2 rounded-lg border border-[#E2E8F0] text-[#64748B] hover:bg-[#F7F9FC] hover:text-[#172033] shrink-0"
+              title="Kembali ke Ruang Kelas"
             >
               <ArrowLeft className="w-4 h-4" />
             </button>
             <div className="min-w-0">
-              <div className="flex items-center gap-2 text-xs text-slate-500">
-                <span className="font-semibold text-slate-900">
-                  Assessment & Examination Builder
+              <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-[#64748B]">
+                <span className="truncate max-w-[160px] font-medium text-[#172033]">
+                  {classroom?.name || 'Ruang Kelas'}
                 </span>
-                <span>·</span>
-                <span>Mode: {assessmentMode}</span>
+                <span>/</span>
+                <span className="px-1.5 py-0.5 rounded bg-blue-50 text-[#2563EB] font-semibold">
+                  {assessmentMode}
+                </span>
                 <span>·</span>
                 <span className="font-mono tabular-nums">
-                  Total Poin Soal: {totalConfiguredPoints} / {maxScore}
+                  {questionsList.length} Soal · {totalConfiguredPoints}/{maxScore} Poin
                 </span>
               </div>
-              <h1 className="text-base font-bold text-slate-900 truncate">
-                {title || 'Asesmen / Ujian Baru'}
+              <h1 className="text-sm sm:text-base font-bold text-[#14213D] truncate">
+                {title || 'Evaluasi / Ujian Baru'}
               </h1>
             </div>
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            <span
+              className={`hidden sm:inline-flex items-center px-2 py-1 rounded text-[11px] font-medium ${
+                saveStatus === 'saving'
+                  ? 'bg-blue-50 text-[#2563EB]'
+                  : saveStatus === 'saved'
+                  ? 'bg-emerald-50 text-emerald-700'
+                  : saveStatus === 'error'
+                  ? 'bg-rose-50 text-rose-700'
+                  : saveStatus === 'unsaved'
+                  ? 'bg-amber-50 text-amber-700'
+                  : 'text-[#64748B]'
+              }`}
+            >
+              {saveStatus === 'saving'
+                ? 'Menyimpan...'
+                : saveStatus === 'saved'
+                ? 'Tersimpan'
+                : saveStatus === 'error'
+                ? 'Gagal menyimpan'
+                : saveStatus === 'unsaved'
+                ? 'Perubahan belum disimpan'
+                : 'Siap'}
+            </span>
             <button
               type="button"
               disabled={saving}
               onClick={() => handleSaveAssessment('DRAFT')}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold border border-slate-300 bg-white text-slate-800 hover:bg-slate-50 whitespace-nowrap"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-[#E2E8F0] bg-white text-[#172033] hover:bg-[#F7F9FC] whitespace-nowrap"
             >
-              <Save className="w-4 h-4" />
+              <Save className="w-3.5 h-3.5" />
               Simpan Draf
             </button>
             <button
               type="button"
               disabled={saving}
               onClick={() => handleSaveAssessment('PUBLISHED')}
-              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 whitespace-nowrap"
+              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold bg-[#14213D] hover:bg-[#1e2f52] text-white whitespace-nowrap"
             >
-              <Send className="w-4 h-4" />
+              <Send className="w-3.5 h-3.5" />
               Terbitkan Ujian
             </button>
           </div>
         </div>
       </header>
 
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-6 space-y-6">
-        {/* Segmented Navigation Tabs */}
-        <div className="flex flex-wrap items-center gap-1 p-1.5 bg-slate-200/70 rounded-xl w-fit">
+      <div className="max-w-[1440px] mx-auto px-4 sm:px-6 pt-5 space-y-5">
+        {/* 5 Primary Workflow Stages */}
+        <nav
+          aria-label="Tahapan Penyusunan Ujian"
+          className="flex flex-wrap items-center gap-1.5 p-1 bg-white border border-[#E2E8F0] rounded-xl w-full sm:w-fit"
+        >
           {[
-            { id: 'general', label: '01. Informasi & Mode Ujian', icon: BookOpen },
-            {
-              id: 'questions',
-              label: `02. Editor Soal & Pool (${questionsList.length})`,
-              icon: Layers,
-            },
-            {
-              id: 'bank',
-              label: `03. Bank Soal Terpadu (${bankQuestions.length})`,
-              icon: Database,
-            },
-            { id: 'settings', label: '04. Aturan, Timer & Keamanan', icon: Settings },
-            { id: 'preview', label: '05. Pratinjau Mahasiswa', icon: Eye },
+            { id: 'general', label: '01. Informasi Ujian', icon: BookOpen },
+            { id: 'questions', label: `02. Penyusunan Soal (${questionsList.length})`, icon: Layers },
+            { id: 'settings', label: '03. Aturan & Keamanan', icon: Settings },
+            { id: 'preview', label: '04. Pratinjau', icon: Eye },
+            { id: 'publish', label: '05. Publikasi & Kelola', icon: Send },
           ].map((t) => {
             const Icon = t.icon;
             return (
@@ -621,10 +725,10 @@ export const AssessmentBuilderPage: React.FC = () => {
                 key={t.id}
                 type="button"
                 onClick={() => setActiveTab(t.id as BuilderTab)}
-                className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition whitespace-nowrap ${
+                className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold transition whitespace-nowrap ${
                   activeTab === t.id
-                    ? 'bg-slate-900 text-white shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
+                    ? 'bg-[#14213D] text-white'
+                    : 'text-[#64748B] hover:text-[#172033] hover:bg-[#F7F9FC]'
                 }`}
               >
                 <Icon className="w-3.5 h-3.5" />
@@ -632,7 +736,7 @@ export const AssessmentBuilderPage: React.FC = () => {
               </button>
             );
           })}
-        </div>
+        </nav>
 
         {/* =================================================================
             TAB 1: GENERAL INFORMATION & THREE ASSESSMENT MODES
@@ -857,69 +961,53 @@ export const AssessmentBuilderPage: React.FC = () => {
         )}
 
         {/* =================================================================
-            TAB 2: QUESTION MANAGEMENT & DEDICATED QUESTION EDITORS
+            TAB 2: THREE-AREA QUESTION WORKSPACE (NAVIGATOR + EDITOR + PROPERTIES)
         ================================================================= */}
         {activeTab === 'questions' && (
-          <div className="space-y-6">
-            {/* Toolbar to Add Any Objective or Essay Question Type */}
-            <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
-              <div className="flex flex-wrap items-center justify-between gap-4">
-                <div>
-                  <h2 className="text-sm font-bold text-slate-900">
-                    Manajemen Butir Soal & Pool Acak
-                  </h2>
-                  <p className="text-xs text-slate-500">
-                    Tambahkan soal objektif (8 tipe), soal esai dengan rubrik (7 tipe), atau pool soal acak dari Bank Soal.
-                  </p>
-                </div>
+          <div className="space-y-4">
+            {/* Compact Contextual Toolbar */}
+            <div className="bg-white rounded-xl border border-[#E2E8F0] px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-bold text-[#14213D]">
+                  Workspace Penyusunan Soal
+                </h2>
+                <p className="text-xs text-[#64748B]">
+                  Pilih soal di navigator kiri, sunting di tengah, dan atur properti kontekstual di kanan.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setAddModalOpen(true)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#14213D] hover:bg-[#1e2f52] text-white text-xs font-semibold"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  Tambah Soal
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRepoModalOpen(true)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#E2E8F0] bg-white hover:bg-[#F7F9FC] text-[#172033] text-xs font-semibold"
+                >
+                  <Database className="w-3.5 h-3.5 text-[#2563EB]" />
+                  Bank Soal
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setImportModalOpen(true)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#E2E8F0] bg-white hover:bg-[#F7F9FC] text-[#172033] text-xs font-semibold"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-700" />
+                  Import Excel / CSV
+                </button>
                 <button
                   type="button"
                   onClick={handleAddQuestionPool}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-amber-400 bg-amber-50 text-amber-950 text-xs font-bold hover:bg-amber-100"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#E2E8F0] bg-[#F7F9FC] hover:bg-slate-100 text-[#172033] text-xs font-semibold"
                 >
-                  <Shuffle className="w-3.5 h-3.5" />
-                  Tambah Pool Soal Acak (Random Question Pool)
+                  <Shuffle className="w-3.5 h-3.5 text-[#2563EB]" />
+                  Pool Acak
                 </button>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-slate-100">
-                <div>
-                  <span className="block text-[11px] font-bold uppercase text-slate-500 mb-2">
-                    + Tambah Soal Objektif (Otomatis Server-Side)
-                  </span>
-                  <div className="flex flex-wrap gap-1.5">
-                    {OBJECTIVE_TYPES.map((ot) => (
-                      <button
-                        key={ot.value}
-                        type="button"
-                        onClick={() =>
-                          handleAddBlankQuestion('OBJECTIVE', ot.value)
-                        }
-                        className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-900 hover:text-white text-xs font-semibold transition"
-                      >
-                        + {ot.label.split(' (')[0]}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div>
-                  <span className="block text-[11px] font-bold uppercase text-slate-500 mb-2">
-                    + Tambah Soal Esai & Studi Kasus (Manual / Rubrik)
-                  </span>
-                  <div className="flex flex-wrap gap-1.5">
-                    {ESSAY_TYPES.map((et) => (
-                      <button
-                        key={et.value}
-                        type="button"
-                        onClick={() => handleAddBlankQuestion('ESSAY', et.value)}
-                        className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:bg-amber-500 hover:text-slate-950 text-xs font-semibold transition"
-                      >
-                        + {et.label.split(' (')[0]}
-                      </button>
-                    ))}
-                  </div>
-                </div>
               </div>
             </div>
 
@@ -1049,13 +1137,74 @@ export const AssessmentBuilderPage: React.FC = () => {
               </div>
             )}
 
-            {/* Individual Question Editors */}
-            <div className="space-y-4">
-              {questionsList.map((q, qIdx) => (
-                <div
-                  key={qIdx}
-                  className="bg-white rounded-xl border border-slate-200 p-6 space-y-4"
-                >
+            {/* Three-Area Editor Workspace: Left Navigator | Center Editor | Right Properties */}
+            <div className="flex flex-col lg:flex-row gap-4 items-start">
+              <QuestionNavigatorPanel
+                questions={questionsList}
+                selectedIndex={selectedQuestionIndex}
+                collapsed={leftCollapsed}
+                onToggleCollapse={() => setLeftCollapsed((v) => !v)}
+                onSelect={(idx) => setSelectedQuestionIndex(idx)}
+                onReorder={(from, to) => {
+                  setQuestionsList((prev) => {
+                    const next = [...prev];
+                    const [moved] = next.splice(from, 1);
+                    next.splice(to, 0, moved);
+                    return next;
+                  });
+                  setSelectedQuestionIndex(to);
+                }}
+                onDuplicate={(idx) => {
+                  handleDuplicateQuestionItem(idx);
+                  setSelectedQuestionIndex(idx + 1);
+                }}
+                onRequestDelete={(idx) =>
+                  deleteConfirm.requestConfirmation({
+                    item: { idx },
+                    title: 'Hapus Butir Soal?',
+                    description: `Apakah Anda yakin ingin menghapus Soal #${idx + 1} dari evaluasi ini?`,
+                    itemName: questionsList[idx]?.promptText?.slice(0, 60) || `Soal #${idx + 1}`,
+                    actionLabel: 'Hapus Soal',
+                    variant: 'destructive',
+                    onConfirm: ({ idx: targetIdx }) => {
+                      setQuestionsList((prev) => prev.filter((_, i) => i !== targetIdx));
+                      setSelectedQuestionIndex((cur) => Math.max(0, cur - 1));
+                    },
+                  })
+                }
+                onOpenAddModal={() => setAddModalOpen(true)}
+              />
+
+              {/* Center Panel: Focused Single-Question Editor */}
+              <div className="flex-1 min-w-0 w-full space-y-4">
+                {questionsList.length === 0 ? (
+                  <div className="bg-white rounded-xl border border-dashed border-[#E2E8F0] p-12 text-center space-y-3">
+                    <Layers className="w-8 h-8 text-[#64748B] mx-auto" />
+                    <div>
+                      <h3 className="text-sm font-bold text-[#172033]">
+                        Belum Ada Soal dalam Evaluasi Ini
+                      </h3>
+                      <p className="text-xs text-[#64748B] mt-1">
+                        Mulai dengan membuat soal baru, mengambil dari Bank Soal, atau mengimpor Excel/CSV.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setAddModalOpen(true)}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-[#14213D] text-white text-xs font-semibold hover:bg-[#1e2f52]"
+                    >
+                      <Plus className="w-4 h-4" />
+                      Tambah Soal Pertama
+                    </button>
+                  </div>
+                ) : (
+                  [questionsList[Math.min(selectedQuestionIndex, questionsList.length - 1)]].map((q) => {
+                    const qIdx = Math.min(selectedQuestionIndex, questionsList.length - 1);
+                    return (
+                      <div
+                        key={qIdx}
+                        className="bg-white rounded-xl border border-[#E2E8F0] p-6 space-y-4"
+                      >
                   <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
                     <div className="flex items-center gap-2 text-xs">
                       <span className="font-mono font-bold text-slate-900">
@@ -1215,6 +1364,46 @@ export const AssessmentBuilderPage: React.FC = () => {
                       }
                       placeholder="Tuliskan teks soal atau studi kasus..."
                       className="w-full px-3.5 py-2 rounded-lg border border-slate-300 text-xs"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                      Lampiran Media Soal (Gambar WebP & Audio)
+                    </label>
+                    <QuestionMediaUploader
+                      value={(q.media || []).map((m: any) => ({
+                        ...m,
+                        url:
+                          m.url ||
+                          `/api/v1/questions/media/stream?key=${encodeURIComponent(m.objectKey)}`,
+                        thumbnailUrl: m.thumbnailKey
+                          ? `/api/v1/questions/media/stream?key=${encodeURIComponent(m.thumbnailKey)}`
+                          : m.thumbnailUrl,
+                      }))}
+                      onAdd={(newMedia: UploadedQuestionMedia) =>
+                        setQuestionsList((prev) =>
+                          prev.map((item, i) =>
+                            i === qIdx
+                              ? { ...item, media: [...(item.media || []), newMedia] }
+                              : item
+                          )
+                        )
+                      }
+                      onRemove={(mIdx: number) =>
+                        setQuestionsList((prev) =>
+                          prev.map((item, i) =>
+                            i === qIdx
+                              ? {
+                                  ...item,
+                                  media: (item.media || []).filter(
+                                    (_: unknown, idx: number) => idx !== mIdx
+                                  ),
+                                }
+                              : item
+                          )
+                        )
+                      }
                     />
                   </div>
 
@@ -1645,90 +1834,26 @@ export const AssessmentBuilderPage: React.FC = () => {
                     />
                   </div>
                 </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* =================================================================
-            TAB 3: QUESTION BANK MANAGEMENT & IMPORT
-        ================================================================= */}
-        {activeTab === 'bank' && (
-          <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-5">
-            <div className="flex flex-wrap items-center justify-between gap-4">
-              <div>
-                <h2 className="text-base font-bold text-slate-900">
-                  Bank Soal Terpadu (Question Bank Repository)
-                </h2>
-                <p className="text-xs text-slate-500">
-                  Impor butir soal terstandarisasi berdasarkan topik, tingkat kesulitan, dan CPMK ke dalam asesmen ini.
-                </p>
+                    );
+                  })
+                )}
               </div>
-              <select
-                value={selectedBankId}
-                onChange={(e) => handleSelectBank(e.target.value)}
-                className="px-3.5 py-2 rounded-lg border border-slate-300 text-xs font-bold bg-white"
-              >
-                {questionBanks.map((b) => (
-                  <option key={b.id} value={b.id}>
-                    {b.title} ({b.questionCount || 0} Soal)
-                  </option>
-                ))}
-              </select>
-            </div>
 
-            <div className="divide-y divide-slate-100">
-              {bankQuestions.map((bq) => {
-                const alreadyAdded = questionsList.some(
-                  (q) => q.questionId === bq.id
-                );
-                return (
-                  <div
-                    key={bq.id}
-                    className="py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
-                  >
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-2 text-xs text-slate-500 font-mono">
-                        <span className="font-bold text-slate-900">
-                          {bq.questionMode} · {bq.questionType}
-                        </span>
-                        <span>·</span>
-                        <span>Kesulitan: {bq.difficulty}</span>
-                        <span>·</span>
-                        <span>{bq.points} Poin</span>
-                        {bq.learningOutcome && (
-                          <>
-                            <span>·</span>
-                            <span>{bq.learningOutcome}</span>
-                          </>
-                        )}
-                      </div>
-                      <p className="text-sm font-semibold text-slate-900">
-                        {bq.promptText}
-                      </p>
-                    </div>
-
-                    <button
-                      type="button"
-                      disabled={alreadyAdded}
-                      onClick={() => handleImportQuestionFromBank(bq)}
-                      className={`px-3.5 py-2 rounded-lg text-xs font-bold shrink-0 ${
-                        alreadyAdded
-                          ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                          : 'bg-slate-900 text-white hover:bg-slate-800'
-                      }`}
-                    >
-                      {alreadyAdded ? (
-                        <span className="inline-flex items-center gap-1">
-                          <CheckCircle2 className="w-3.5 h-3.5" /> Terdaftar di Ujian
-                        </span>
-                      ) : (
-                        '+ Impor ke Ujian'
-                      )}
-                    </button>
-                  </div>
-                );
-              })}
+              <QuestionPropertiesPanel
+                question={
+                  questionsList.length > 0
+                    ? questionsList[Math.min(selectedQuestionIndex, questionsList.length - 1)]
+                    : null
+                }
+                collapsed={rightCollapsed}
+                onToggleCollapse={() => setRightCollapsed((v) => !v)}
+                onChange={(patch) => {
+                  const activeIdx = Math.min(selectedQuestionIndex, questionsList.length - 1);
+                  setQuestionsList((prev) =>
+                    prev.map((item, i) => (i === activeIdx ? { ...item, ...patch } : item))
+                  );
+                }}
+              />
             </div>
           </div>
         )}
@@ -1880,65 +2005,257 @@ export const AssessmentBuilderPage: React.FC = () => {
         )}
 
         {/* =================================================================
-            TAB 5: STUDENT PREVIEW BEFORE PUBLISHING
+            TAB 6: STUDENT PREVIEW BEFORE PUBLISHING (DESKTOP & MOBILE)
         ================================================================= */}
         {activeTab === 'preview' && (
-          <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-6">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-4">
-              <div>
-                <span className="text-xs font-mono uppercase text-amber-700 font-bold">
-                  Simulasi Tampilan Mahasiswa (Tanpa Kunci Jawaban)
-                </span>
-                <h2 className="text-lg font-bold text-slate-900 mt-0.5">
-                  {title || 'Pratinjau Ujian'}
-                </h2>
-              </div>
-              <div className="text-right font-mono text-xs text-slate-600">
-                <div>Durasi: {durationMinutes} Menit</div>
-                <div>Skor Maksimum: {maxScore} Poin</div>
-              </div>
-            </div>
-
-            <div className="prose prose-slate max-w-none text-sm p-4 rounded-xl bg-slate-50 border border-slate-200">
-              <TiptapReadOnlyRenderer contentJson={instructionsJson} />
-            </div>
-
-            <div className="space-y-4">
-              {questionsList.map((q, idx) => (
-                <div
-                  key={idx}
-                  className="p-5 rounded-xl border border-slate-200 space-y-3"
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 bg-white rounded-xl border border-slate-200 px-5 py-3">
+              <span className="text-xs font-mono uppercase text-amber-700 font-bold">
+                Simulasi Tampilan Mahasiswa (Tanpa Kunci Jawaban)
+              </span>
+              <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg">
+                <button
+                  type="button"
+                  onClick={() => setPreviewViewport('desktop')}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold ${
+                    previewViewport === 'desktop'
+                      ? 'bg-white text-slate-900 shadow-xs'
+                      : 'text-slate-600'
+                  }`}
                 >
-                  <div className="flex items-center justify-between text-xs text-slate-500 font-mono">
-                    <span className="font-bold text-slate-900">
-                      Butir Soal #{idx + 1} ({q.questionType})
-                    </span>
-                    <span>{q.points} Poin</span>
-                  </div>
-                  <p className="text-sm font-medium text-slate-900">
-                    {q.promptText}
+                  <Monitor className="w-3.5 h-3.5" />
+                  Desktop
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPreviewViewport('mobile')}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold ${
+                    previewViewport === 'mobile'
+                      ? 'bg-white text-slate-900 shadow-xs'
+                      : 'text-slate-600'
+                  }`}
+                >
+                  <Smartphone className="w-3.5 h-3.5" />
+                  Mobile
+                </button>
+              </div>
+            </div>
+
+            <div
+              className={`bg-white rounded-xl border border-slate-200 p-6 space-y-6 mx-auto transition-all ${
+                previewViewport === 'mobile' ? 'max-w-sm shadow-lg' : 'w-full'
+              }`}
+            >
+              <div className="flex items-center justify-between border-b border-slate-100 pb-4">
+                <div>
+                  <h2 className="text-lg font-bold text-slate-900">
+                    {title || 'Pratinjau Ujian'}
+                  </h2>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Mode: {assessmentMode} • {questionsList.length} Soal
                   </p>
-                  {(q.options || []).length > 0 && (
-                    <div className="space-y-1.5 pt-2">
-                      {q.options.map((o: any, oIdx: number) => (
-                        <div
-                          key={oIdx}
-                          className="p-2.5 rounded-lg border border-slate-200 bg-slate-50 text-xs text-slate-700"
-                        >
-                          <span className="font-mono font-bold mr-2">
-                            {o.optionLabel || String.fromCharCode(65 + oIdx)}.
-                          </span>
-                          {o.optionText}
-                        </div>
-                      ))}
-                    </div>
-                  )}
                 </div>
-              ))}
+                <div className="text-right font-mono text-xs text-slate-600">
+                  <div className="font-bold text-blue-700">Sisa Waktu: {durationMinutes}:00</div>
+                  <div>Skor Maksimum: {maxScore} Poin</div>
+                </div>
+              </div>
+
+              <div className="prose prose-slate max-w-none text-sm p-4 rounded-xl bg-slate-50 border border-slate-200">
+                <TiptapReadOnlyRenderer contentJson={instructionsJson} />
+              </div>
+
+              <div className="space-y-4">
+                {questionsList.map((q, idx) => (
+                  <div
+                    key={idx}
+                    className="p-5 rounded-xl border border-slate-200 space-y-3"
+                  >
+                    <div className="flex items-center justify-between text-xs text-slate-500 font-mono">
+                      <span className="font-bold text-slate-900">
+                        Butir Soal #{idx + 1} ({q.questionType})
+                      </span>
+                      <span>{q.points} Poin</span>
+                    </div>
+                    <p className="text-sm font-medium text-slate-900">
+                      {q.promptText}
+                    </p>
+                    {Array.isArray(q.media) && q.media.length > 0 && (
+                      <div className="space-y-2">
+                        {q.media.map((m: any, mIdx: number) =>
+                          m.mediaType === 'AUDIO' ? (
+                            <audio
+                              key={mIdx}
+                              controls
+                              preload="metadata"
+                              className="w-full h-9"
+                              src={`/api/v1/questions/media/stream?key=${encodeURIComponent(m.objectKey)}`}
+                            />
+                          ) : (
+                            <img
+                              key={mIdx}
+                              loading="lazy"
+                              alt={m.originalName || 'Lampiran soal'}
+                              src={`/api/v1/questions/media/stream?key=${encodeURIComponent(m.objectKey)}`}
+                              className="max-h-56 rounded-lg border border-slate-200"
+                            />
+                          )
+                        )}
+                      </div>
+                    )}
+                    {(q.options || []).length > 0 ? (
+                      <div className="space-y-1.5 pt-2">
+                        {q.options.map((o: any, oIdx: number) => (
+                          <div
+                            key={oIdx}
+                            className="p-2.5 rounded-lg border border-slate-200 bg-slate-50 text-xs text-slate-700"
+                          >
+                            <span className="font-mono font-bold mr-2">
+                              {o.optionLabel || String.fromCharCode(65 + oIdx)}.
+                            </span>
+                            {o.optionText}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <textarea
+                        readOnly
+                        rows={3}
+                        placeholder="Area jawaban esai mahasiswa..."
+                        className="w-full rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500"
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         )}
+
+        {/* =================================================================
+            TAB 5: PUBLIKASI & MANAJEMEN PASCA-PUBLIKASI
+        ================================================================= */}
+        {activeTab === 'publish' && classroomId && (
+          <div className="space-y-6">
+            <div className="bg-white rounded-xl border border-[#E2E8F0] p-6 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-[#E2E8F0]">
+                <div>
+                  <h2 className="text-base font-bold text-[#14213D]">
+                    Kesiapan & Publikasi Evaluasi
+                  </h2>
+                  <p className="text-xs text-[#64748B] mt-0.5">
+                    Periksa kelengkapan ujian sebelum diterbitkan kepada mahasiswa.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={saving}
+                    onClick={() => handleSaveAssessment('DRAFT')}
+                    className="px-3.5 py-2 rounded-lg border border-[#E2E8F0] bg-white text-xs font-semibold text-[#172033] hover:bg-[#F7F9FC]"
+                  >
+                    Simpan sebagai Draf
+                  </button>
+                  <button
+                    type="button"
+                    disabled={saving}
+                    onClick={() => handleSaveAssessment('PUBLISHED')}
+                    className="px-4 py-2 rounded-lg bg-[#14213D] hover:bg-[#1e2f52] text-white text-xs font-bold"
+                  >
+                    Terbitkan Evaluasi Sekarang
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 text-xs">
+                <div className="p-3 rounded-lg bg-[#F7F9FC] border border-[#E2E8F0]">
+                  <div className="text-[#64748B]">Judul Evaluasi</div>
+                  <div className="font-bold text-[#172033] truncate mt-0.5">
+                    {title || 'Belum diisi'}
+                  </div>
+                </div>
+                <div className="p-3 rounded-lg bg-[#F7F9FC] border border-[#E2E8F0]">
+                  <div className="text-[#64748B]">Jumlah Soal & Pool</div>
+                  <div className="font-bold text-[#172033] mt-0.5">
+                    {questionsList.length} Soal · {questionPools.length} Pool
+                  </div>
+                </div>
+                <div className="p-3 rounded-lg bg-[#F7F9FC] border border-[#E2E8F0]">
+                  <div className="text-[#64748B]">Total Bobot / Maks</div>
+                  <div className="font-bold text-[#172033] mt-0.5">
+                    {totalConfiguredPoints} / {maxScore} Poin
+                  </div>
+                </div>
+                <div className="p-3 rounded-lg bg-[#F7F9FC] border border-[#E2E8F0]">
+                  <div className="text-[#64748B]">Status Saat Ini</div>
+                  <div className="font-bold text-[#2563EB] mt-0.5">{status}</div>
+                </div>
+              </div>
+            </div>
+
+            <AssessmentMonitoringSummaryPanel
+              classroomId={classroomId}
+              assessmentId={assessmentId}
+            />
+            <AssessmentGradingAnalyticsPanel
+              classroomId={classroomId}
+              assessmentId={assessmentId}
+            />
+            <AssessmentHistoryPanel assessmentId={assessmentId} />
+          </div>
+        )}
       </div>
+
+      {/* Contextual Modals inside Penyusunan Soal */}
+      <AddQuestionModal
+        open={addModalOpen}
+        onClose={() => setAddModalOpen(false)}
+        onSelectType={(mode, type) => {
+          handleAddBlankQuestion(mode, type);
+          setSelectedQuestionIndex(questionsList.length);
+        }}
+        onOpenRepository={() => setRepoModalOpen(true)}
+        onOpenImport={() => setImportModalOpen(true)}
+      />
+
+      {classroomId && (
+        <ModalDialog
+          open={repoModalOpen}
+          onClose={() => setRepoModalOpen(false)}
+          title="Bank Soal (Question Repository)"
+          maxWidth="max-w-5xl"
+        >
+          <QuestionRepositoryPanel
+            classroomId={classroomId}
+            assessmentId={assessmentId}
+            assessmentStatus={status}
+            onImportedToAssessment={async () => {
+              if (!assessmentId) return;
+              const asmtData = await apiFetch<any>(`/api/v1/assessments/${assessmentId}`);
+              if (asmtData?.assessment?.questions) {
+                setQuestionsList(asmtData.assessment.questions);
+              }
+              setRepoModalOpen(false);
+            }}
+          />
+        </ModalDialog>
+      )}
+
+      {classroomId && (
+        <ModalDialog
+          open={importModalOpen}
+          onClose={() => setImportModalOpen(false)}
+          title="Import Soal Excel / CSV"
+          maxWidth="max-w-5xl"
+        >
+          <QuestionImportCenterPanel
+            classroomId={classroomId}
+            assessmentId={assessmentId}
+          />
+        </ModalDialog>
+      )}
+
+      <ConfirmDialog {...deleteConfirm.dialogProps} />
     </div>
   );
 };

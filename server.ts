@@ -14,14 +14,31 @@ async function startServer() {
   await app.register(fastifyMiddie);
 
   const isProd = process.env.NODE_ENV === 'production';
+  const disableHmr = process.env.DISABLE_HMR === 'true';
 
   if (!isProd) {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        // Bind HMR WebSocket directly to Fastify HTTP server on the same port
+        // Avoids fallback standalone HMR server on port 24678
+        ws: disableHmr ? false : { server: app.server },
+        hmr: disableHmr ? false : { server: app.server },
+      },
       appType: 'spa',
     });
 
     app.use((req, res, next) => {
+      const host = req.headers.host || '';
+      // 0.0.0.0 is an INADDR_ANY server socket bind address, not a valid browser destination.
+      // If a browser connects via 0.0.0.0, redirect to localhost so cookies, storage,
+      // and WebSockets operate within a valid, trustworthy browser origin.
+      if (host.startsWith('0.0.0.0') && !req.url?.startsWith('/api/')) {
+        const redirectHost = host.replace(/^0\.0\.0\.0/, 'localhost');
+        res.writeHead(302, { Location: `http://${redirectHost}${req.url || '/'}` });
+        return res.end();
+      }
+
       if (req.url && req.url.startsWith('/api/')) {
         return next();
       }
@@ -48,6 +65,8 @@ async function startServer() {
           '.css': 'text/css',
           '.svg': 'image/svg+xml',
           '.json': 'application/json',
+          '.ico': 'image/x-icon',
+          '.png': 'image/png',
         };
         reply.type(mimeMap[ext] || 'application/octet-stream');
         return reply.send(fs.readFileSync(requestedPath));
@@ -59,7 +78,9 @@ async function startServer() {
 
   const port = Number(process.env.PORT) || 3000;
   await app.listen({ port, host: '0.0.0.0' });
-  console.log(`Politeknik Kampar LMS (Fastify + PostgreSQL) listening on http://0.0.0.0:${port}`);
+  console.log(`\n  Politeknik Kampar LMS (Fastify + PostgreSQL)`);
+  console.log(`  ➜  Local:   http://localhost:${port}/`);
+  console.log(`  ➜  Network: http://0.0.0.0:${port}/ (listening on all interfaces)\n`);
 }
 
 startServer().catch((err) => {

@@ -16,11 +16,13 @@ import {
   Trash2,
 } from 'lucide-react';
 import { AppShell } from '../components/AppShell';
-import { Button, Input, Card, ModalDialog } from '../components/ui/primitives';
+import { Button, Input, Card, ModalDialog, ConfirmDialog } from '../components/ui/primitives';
 import { apiRequest } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
+import { canPerformMutations } from '../lib/authorization';
 import { formatDate } from '../lib/utils';
 import { toast } from 'sonner';
+import { useDeleteConfirmation } from '../hooks/useDeleteConfirmation';
 
 interface ParticipantResponse {
   instructors: Array<{
@@ -63,11 +65,13 @@ export function ClassroomParticipantsPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { user } = useAuth();
+  const canMutate = canPerformMutations(user);
 
   const [activeTab, setActiveTab] = useState<'active' | 'pending' | 'waitlist'>('active');
   const [rejectModalOpen, setRejectModalOpen] = useState(false);
   const [rejectEnrollmentId, setRejectEnrollmentId] = useState('');
   const [rejectReason, setRejectReason] = useState('');
+  const deleteConfirm = useDeleteConfirmation();
 
   // Fetch Classroom details
   const { data: classroom } = useQuery({
@@ -296,18 +300,31 @@ export function ClassroomParticipantsPage() {
                           </td>
                           <td className="p-3 text-slate-500">{formatDate(s.enrolledAt)}</td>
                           <td className="p-3 text-right">
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              onClick={() => {
-                                if (window.confirm(`Keluarkan ${s.fullName} dari kelas?`)) {
-                                  withdrawMutation.mutate(s.enrollmentId);
+                            {canMutate ? (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() =>
+                                  deleteConfirm.requestConfirmation({
+                                    item: s,
+                                    title: 'Keluarkan Mahasiswa dari Kelas?',
+                                    description: 'Apakah Anda yakin ingin mengeluarkan peserta ini dari ruang kelas?',
+                                    itemName: `${s.fullName} (${s.identityNumber})`,
+                                    warningText:
+                                      'Mahasiswa akan kehilangan akses ke ruang kelas ini, namun riwayat nilai dan pengumpulan tugas sebelumnya tetap tersimpan.',
+                                    actionLabel: 'Ya, Keluarkan',
+                                    onConfirm: async () => {
+                                      await withdrawMutation.mutateAsync(s.enrollmentId);
+                                    },
+                                  })
                                 }
-                              }}
-                              className="text-red-600 hover:bg-red-50 text-xs h-7 px-2"
-                            >
-                              Keluarkan
-                            </Button>
+                                className="text-red-600 hover:bg-red-50 text-xs h-7 px-2"
+                              >
+                                Keluarkan
+                              </Button>
+                            ) : (
+                              <span className="text-[11px] text-slate-400">Read-Only</span>
+                            )}
                           </td>
                         </tr>
                       ))}
@@ -345,24 +362,30 @@ export function ClassroomParticipantsPage() {
                           <td className="p-3 text-slate-500">{s.email}</td>
                           <td className="p-3 text-slate-500">{formatDate(s.enrolledAt)}</td>
                           <td className="p-3 text-right space-x-2">
-                            <Button
-                              size="sm"
-                              onClick={() => approveMutation.mutate(s.enrollmentId)}
-                              className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs h-7 px-2.5"
-                            >
-                              <CheckCircle2 className="w-3.5 h-3.5 mr-1" /> Setujui
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              onClick={() => {
-                                setRejectEnrollmentId(s.enrollmentId);
-                                setRejectModalOpen(true);
-                              }}
-                              className="text-red-600 border-red-200 hover:bg-red-50 text-xs h-7 px-2.5"
-                            >
-                              <XCircle className="w-3.5 h-3.5 mr-1" /> Tolak
-                            </Button>
+                            {canMutate ? (
+                              <>
+                                <Button
+                                  size="sm"
+                                  onClick={() => approveMutation.mutate(s.enrollmentId)}
+                                  className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs h-7 px-2.5"
+                                >
+                                  <CheckCircle2 className="w-3.5 h-3.5 mr-1" /> Setujui
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => {
+                                    setRejectEnrollmentId(s.enrollmentId);
+                                    setRejectModalOpen(true);
+                                  }}
+                                  className="text-red-600 border-red-200 hover:bg-red-50 text-xs h-7 px-2.5"
+                                >
+                                  <XCircle className="w-3.5 h-3.5 mr-1" /> Tolak
+                                </Button>
+                              </>
+                            ) : (
+                              <span className="text-[11px] text-slate-400">Read-Only</span>
+                            )}
                           </td>
                         </tr>
                       ))}
@@ -454,6 +477,7 @@ export function ClassroomParticipantsPage() {
             </div>
           </div>
         </ModalDialog>
+        <ConfirmDialog {...deleteConfirm.dialogProps} />
       </div>
     </AppShell>
   );

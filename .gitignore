@@ -6,3 +6,8 @@ coverage/
 *.log
 .env*
 !.env.example
+# Ignore all Markdown files
+*.md
+
+# Allow README.md
+!README.md

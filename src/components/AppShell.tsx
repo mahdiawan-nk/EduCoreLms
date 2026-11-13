@@ -1,20 +1,31 @@
-import React, { useState } from 'react';
-import { Link, useLocation, useNavigate } from 'react-router-dom';
+import React, { useState, useEffect } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import {
-  BookOpen,
-  GraduationCap,
-  ShieldCheck,
+  LayoutDashboard,
+  CalendarDays,
+  Presentation,
   Users,
-  Bell,
-  LogOut,
-  Menu,
-  X,
-  FileCode2,
+  ShieldCheck,
+  ShieldAlert,
+  BookOpen,
+  BookMarked,
+  PlusCircle,
+  UserRoundCheck,
+  ArrowLeft,
+  Settings,
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { useAppConfig } from '../context/ThemeContext';
 import { Button, ModalDialog } from './ui/primitives';
 import { formatDateTime } from '../lib/utils';
-import { apiRequest } from '../lib/api';
+import {
+  hasAnyPermission,
+  hasPermission,
+  isSuperadminUser,
+  canPerformMutations,
+} from '../lib/authorization';
+import { GlobalSidebar, NavGroup, NavItem } from './layout/GlobalSidebar';
+import { GlobalTopbar } from './layout/GlobalTopbar';
 import { toast } from 'sonner';
 
 export function AppShell({
@@ -28,342 +39,313 @@ export function AppShell({
 }) {
   const {
     user,
+    impersonation,
     notifications,
-    logout,
     markAllNotificationsRead,
-    loginWithCredentials,
+    stopImpersonation,
   } = useAuth();
+  const { config, applyPageSeo } = useAppConfig();
+  const [stoppingImpersonation, setStoppingImpersonation] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
 
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [isCompact, setIsCompact] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('pk_lms_sidebar_compact') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>(() => {
+    try {
+      const stored = localStorage.getItem('pk_lms_nav_collapsed');
+      return stored ? JSON.parse(stored) : {};
+    } catch {
+      return {};
+    }
+  });
+
   const [notifOpen, setNotifOpen] = useState(false);
-  const [openApiModal, setOpenApiModal] = useState(false);
-  const [openApiJson, setOpenApiJson] = useState<string>('');
-  const [switchingRole, setSwitchingRole] = useState(false);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('pk_lms_sidebar_compact', String(isCompact));
+    } catch {
+      // ignore
+    }
+  }, [isCompact]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('pk_lms_nav_collapsed', JSON.stringify(collapsedGroups));
+    } catch {
+      // ignore
+    }
+  }, [collapsedGroups]);
+
+  useEffect(() => {
+    setMobileMenuOpen(false);
+  }, [location.pathname]);
+
+  useEffect(() => {
+    applyPageSeo({
+      pageTitle: breadcrumb,
+      isAuthenticatedPage: true,
+      pathname: location.pathname,
+    });
+  }, [applyPageSeo, breadcrumb, location.pathname]);
 
   if (!user) return <>{children}</>;
 
-  const isSuperadmin = user.roles.includes('SUPERADMIN');
-  const isDosen = user.roles.includes('DOSEN');
-  const primaryRoleLabel = isSuperadmin
-    ? 'Superadmin Akademik'
-    : isDosen
-      ? 'Dosen Pengampu'
-      : 'Mahasiswa';
-
   const unreadCount = notifications.filter((n) => !n.isRead).length;
 
-  const handleOpenSpec = async () => {
-    try {
-      const res = await apiRequest<Record<string, unknown>>('/openapi.json');
-      setOpenApiJson(JSON.stringify(res.data, null, 2));
-      setOpenApiModal(true);
-    } catch (err: any) {
-      toast.error(err.message || 'Gagal memuat spesifikasi OpenAPI');
-    }
+  const toggleGroup = (groupId: string) => {
+    setCollapsedGroups((prev) => ({
+      ...prev,
+      [groupId]: !prev[groupId],
+    }));
   };
 
-  const handleQuickSwitchActor = async (email: string, password: string, label: string) => {
-    try {
-      setSwitchingRole(true);
-      await loginWithCredentials(email, password);
-      toast.success(`Beralih sesi ke ${label}`);
-      navigate('/');
-    } catch (err: any) {
-      toast.error(err.message || 'Gagal beralih akun');
-    } finally {
-      setSwitchingRole(false);
-    }
+  const rawNavGroups: NavGroup[] = [
+    {
+      id: 'utama',
+      label: 'UTAMA',
+      items: [
+        {
+          label: 'Dashboard',
+          to: '/',
+          icon: LayoutDashboard,
+          exact: true,
+          visible: true,
+        },
+      ],
+    },
+    {
+      id: 'akademik',
+      label: 'MANAJEMEN AKADEMIK',
+      items: [
+        {
+          label: 'Periode Akademik',
+          to: '/academic-periods',
+          icon: CalendarDays,
+          visible: hasPermission(user, 'academic_period.view'),
+        },
+      ],
+    },
+    {
+      id: 'kelas',
+      label: 'MANAJEMEN RUANG KELAS',
+      items: [
+        {
+          label: 'Ruang Kelas',
+          to: '/classrooms',
+          icon: Presentation,
+          visible: hasAnyPermission(user, [
+            'classrooms:view',
+            'classrooms:manage_all',
+            'classrooms:teach',
+            'enrollments:join',
+          ]),
+        },
+        {
+          label: 'Buat Ruang Kelas (Wizard)',
+          to: '/classrooms/new',
+          icon: PlusCircle,
+          visible:
+            canPerformMutations(user) &&
+            hasPermission(user, 'classrooms:create'),
+        },
+      ],
+    },
+    {
+      id: 'sistem',
+      label: 'SISTEM & KEAMANAN',
+      items: [
+        {
+          label: 'Pengaturan Sistem',
+          to: '/admin/settings',
+          icon: Settings,
+          visible:
+            canPerformMutations(user) &&
+            isSuperadminUser(user) &&
+            hasPermission(user, 'system_settings.view'),
+        },
+        {
+          label: 'Manajemen Pengguna',
+          to: '/admin/users',
+          icon: Users,
+          visible: hasAnyPermission(user, ['users:read', 'users:manage']),
+        },
+        {
+          label: 'Role & Permission (RBAC)',
+          to: '/admin/rbac',
+          icon: ShieldCheck,
+          visible: hasAnyPermission(user, ['rbac:view', 'rbac:manage']),
+        },
+        {
+          label: 'Log Audit Keamanan',
+          to: '/admin/audit-logs',
+          icon: ShieldAlert,
+          visible: hasPermission(user, 'audit:view'),
+        },
+        {
+          label: 'Kelola Knowledge Center',
+          to: '/admin/help',
+          icon: BookMarked,
+          visible:
+            canPerformMutations(user) &&
+            isSuperadminUser(user) &&
+            hasPermission(user, 'knowledge.manage'),
+        },
+      ],
+    },
+    {
+      id: 'bantuan',
+      label: 'BANTUAN & DOKUMENTASI',
+      items: [
+        {
+          label: 'Pusat Bantuan',
+          to: '/help',
+          icon: BookOpen,
+          visible: hasAnyPermission(user, ['knowledge.view', 'knowledge.manage']),
+        },
+      ],
+    },
+  ];
+
+  const currentGroups: NavGroup[] = rawNavGroups
+    .map((group) => ({
+      id: group.id,
+      label: group.label,
+      items: group.items.filter((item) => item.visible),
+    }))
+    .filter((group) => group.items.length > 0);
+
+  const isRouteActive = (item: NavItem) => {
+    if (item.isAction) return false;
+    if (item.exact) return location.pathname === item.to;
+    return location.pathname.startsWith(item.to);
   };
+
+  const handleActionItem = (_item: NavItem) => {
+    // Reserved for future action navigation items
+  };
+
+  const contentPaddingClass = isCompact ? 'lg:pl-[72px]' : 'lg:pl-[264px]';
 
   return (
-    <div className="min-h-screen flex bg-slate-50 text-slate-900">
-      {/* Desktop Sidebar (264px width per SaaS Workspace Canvas contract) */}
-      <aside className="hidden lg:flex lg:w-[264px] lg:flex-col lg:fixed lg:inset-y-0 border-r border-slate-200 bg-white">
-        <div className="flex items-center justify-between px-6 h-16 border-b border-slate-200">
-          <Link
-            to="/"
-            className="flex items-center gap-2.5 text-base font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
+    <div
+      className="min-h-screen flex transition-colors"
+      style={{
+        backgroundColor: 'var(--theme-content-bg)',
+        color: 'var(--theme-text-primary)',
+      }}
+    >
+      <GlobalSidebar
+        groups={currentGroups}
+        isCompact={isCompact}
+        onToggleCompact={() => setIsCompact((prev) => !prev)}
+        collapsedGroups={collapsedGroups}
+        onToggleGroup={toggleGroup}
+        mobileMenuOpen={mobileMenuOpen}
+        onCloseMobileMenu={() => setMobileMenuOpen(false)}
+        isRouteActive={isRouteActive}
+        onActionItem={handleActionItem}
+      />
+
+      <div
+        className={`flex-1 flex flex-col ${contentPaddingClass} min-w-0 transition-all duration-200`}
+      >
+        {/* Permanent Impersonation Indicator Banner */}
+        {impersonation?.isImpersonating && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="sticky top-0 z-40 border-b border-amber-400 bg-amber-500 text-slate-950 px-4 sm:px-6 py-2.5 shadow-sm"
           >
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-900 text-amber-400">
-              <GraduationCap className="h-4 w-4" />
-            </div>
-            <span>Politeknik Kampar</span>
-          </Link>
-        </div>
-
-        {/* Actor Identity Summary (Clean unboxed metadata) */}
-        <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/60">
-          <p className="text-sm font-semibold text-slate-900 truncate">
-            {user.fullName}
-          </p>
-          <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-slate-500">
-            <span>{primaryRoleLabel}</span>
-            <span aria-hidden="true">·</span>
-            <span className="font-mono tabular-nums">
-              {user.identityNumber || 'Terverifikasi'}
-            </span>
-          </div>
-          <p className="mt-1 text-xs text-slate-500 truncate">
-            {user.studyProgram}
-          </p>
-        </div>
-
-        {/* Primary Workspace Navigation */}
-        <nav className="flex-1 px-4 py-5 space-y-1">
-          <Link
-            to="/"
-            className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap shrink-0 ${
-              location.pathname === '/'
-                ? 'bg-slate-900 text-white'
-                : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
-            }`}
-          >
-            <BookOpen className="h-4 w-4 shrink-0" />
-            <span>
-              {isSuperadmin
-                ? 'Pusat Kendali Superadmin'
-                : isDosen
-                  ? 'Ruang Pengajaran Dosen'
-                  : 'Ruang Belajar Mahasiswa'}
-            </span>
-          </Link>
-
-          <button
-            type="button"
-            onClick={handleOpenSpec}
-            className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <FileCode2 className="h-4 w-4 shrink-0" />
-            <span>Spesifikasi OpenAPI v1</span>
-          </button>
-        </nav>
-
-        {/* Quick Actor Switcher for Testing 3 Primary Actors */}
-        <div className="px-4 py-4 border-t border-slate-200 bg-slate-50/50">
-          <p className="px-2 text-xs font-semibold text-slate-700">
-            Simulasi Aktor Produksi
-          </p>
-          <p className="px-2 mt-0.5 text-xs text-slate-500">
-            Uji sesi nyata Argon2id & RBAC:
-          </p>
-          <div className="mt-2.5 space-y-1">
-            <button
-              type="button"
-              disabled={switchingRole}
-              onClick={() =>
-                handleQuickSwitchActor(
-                  'superadmin@poltek-kampar.ac.id',
-                  'AdminPolkam#2026',
-                  'Superadmin (Ir. Hendra Pratama)'
-                )
-              }
-              className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors cursor-pointer ${
-                isSuperadmin
-                  ? 'bg-slate-900 text-white'
-                  : 'text-slate-600 hover:bg-slate-200/70'
-              }`}
-            >
-              <span className="flex items-center gap-2 truncate">
-                <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
-                <span>Superadmin</span>
-              </span>
-              <span className="font-mono text-[11px] opacity-75">RBAC Penuh</span>
-            </button>
-
-            <button
-              type="button"
-              disabled={switchingRole}
-              onClick={() =>
-                handleQuickSwitchActor(
-                  'fitriani.dosen@poltek-kampar.ac.id',
-                  'DosenPolkam#2026',
-                  'Dosen (Dr. Fitriani Syahrir)'
-                )
-              }
-              className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors cursor-pointer ${
-                isDosen && !isSuperadmin
-                  ? 'bg-slate-900 text-white'
-                  : 'text-slate-600 hover:bg-slate-200/70'
-              }`}
-            >
-              <span className="flex items-center gap-2 truncate">
-                <Users className="h-3.5 w-3.5 shrink-0" />
-                <span>Dosen Pengampu</span>
-              </span>
-              <span className="font-mono text-[11px] opacity-75">NIDN</span>
-            </button>
-
-            <button
-              type="button"
-              disabled={switchingRole}
-              onClick={() =>
-                handleQuickSwitchActor(
-                  'ahmad.mhs@student.poltek-kampar.ac.id',
-                  'MhsPolkam#2026',
-                  'Mahasiswa (Ahmad Fauzan)'
-                )
-              }
-              className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors cursor-pointer ${
-                !isSuperadmin && !isDosen
-                  ? 'bg-slate-900 text-white'
-                  : 'text-slate-600 hover:bg-slate-200/70'
-              }`}
-            >
-              <span className="flex items-center gap-2 truncate">
-                <GraduationCap className="h-3.5 w-3.5 shrink-0" />
-                <span>Mahasiswa</span>
-              </span>
-              <span className="font-mono text-[11px] opacity-75">NIM</span>
-            </button>
-          </div>
-        </div>
-
-        {/* Logout Footer */}
-        <div className="p-4 border-t border-slate-200">
-          <Button
-            type="button"
-            variant="outline"
-            className="w-full justify-start text-slate-700"
-            onClick={async () => {
-              await logout();
-              navigate('/login');
-            }}
-          >
-            <LogOut className="h-4 w-4" />
-            <span>Keluar Sesi</span>
-          </Button>
-        </div>
-      </aside>
-
-      {/* Main Content Area */}
-      <div className="flex-1 flex flex-col lg:pl-[264px] min-w-0">
-        {/* Top Bar Contract: Zone 1 Breadcrumb — Zone 2 Navigation — Zone 3 Primary Action */}
-        <header className="sticky top-0 z-30 flex h-16 items-center justify-between gap-8 border-b border-slate-200 bg-white/95 px-6 backdrop-blur-xs">
-          <div className="flex items-center gap-3 min-w-0">
-            <button
-              type="button"
-              onClick={() => setMobileMenuOpen(true)}
-              className="lg:hidden rounded-lg p-2 text-slate-600 hover:bg-slate-100"
-              aria-label="Buka navigasi"
-            >
-              <Menu className="h-5 w-5" />
-            </button>
-            <div className="flex items-center gap-2 text-sm font-medium text-slate-600 truncate">
-              <Link
-                to="/"
-                className="font-semibold text-slate-900 hover:underline whitespace-nowrap shrink-0"
-              >
-                LMS Politeknik Kampar
-              </Link>
-              {breadcrumb && (
-                <>
-                  <span aria-hidden="true" className="text-slate-400">
-                    /
-                  </span>
-                  <span className="text-slate-700 truncate">{breadcrumb}</span>
-                </>
-              )}
-            </div>
-          </div>
-
-          <div className="flex items-center gap-3 shrink-0">
-            {primaryAction}
-
-            <button
-              type="button"
-              onClick={() => setNotifOpen(true)}
-              className="relative inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 cursor-pointer"
-              aria-label="Notifikasi"
-            >
-              <Bell className="h-4 w-4" />
-              {unreadCount > 0 && (
-                <span className="ml-1 font-mono text-xs font-semibold text-amber-700 tabular-nums">
-                  {unreadCount}
+            <div className="max-w-[1360px] mx-auto flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+              <div className="flex items-start sm:items-center gap-2.5 min-w-0">
+                <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg bg-slate-950/15 text-slate-950 shrink-0 mt-0.5 sm:mt-0">
+                  <UserRoundCheck className="w-4 h-4" />
                 </span>
-              )}
-            </button>
-          </div>
-        </header>
-
-        {/* Mobile Drawer */}
-        {mobileMenuOpen && (
-          <div className="fixed inset-0 z-50 lg:hidden flex">
-            <div
-              className="fixed inset-0 bg-slate-950/50"
-              onClick={() => setMobileMenuOpen(false)}
-            />
-            <div className="relative z-10 w-72 bg-white h-full flex flex-col justify-between p-6">
-              <div>
-                <div className="flex items-center justify-between pb-4 border-b border-slate-200">
-                  <span className="text-base font-bold text-slate-900">
-                    Politeknik Kampar LMS
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setMobileMenuOpen(false)}
-                    className="p-1.5 text-slate-500"
-                  >
-                    <X className="h-5 w-5" />
-                  </button>
-                </div>
-                <div className="py-4 border-b border-slate-100">
-                  <p className="text-sm font-semibold text-slate-900">
-                    {user.fullName}
+                <div className="min-w-0 text-xs sm:text-sm">
+                  <p className="font-bold leading-snug">
+                    Anda sedang mengakses LMS sebagai{' '}
+                    <span className="underline decoration-slate-950/40 underline-offset-2">
+                      {impersonation.impersonatedUserName}
+                    </span>{' '}
+                    ({impersonation.impersonatedRole}).
                   </p>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    {primaryRoleLabel} · {user.studyProgram}
+                  <p className="text-[11px] text-slate-900/90 mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                    <span>
+                      Superadmin Asli: <strong>{impersonation.originalUserName}</strong>
+                    </span>
+                    <span aria-hidden="true">•</span>
+                    <span>
+                      Role Tujuan: <strong>{impersonation.impersonatedRole}</strong>
+                    </span>
+                    <span aria-hidden="true">•</span>
+                    <span>
+                      Mulai: <strong>{formatDateTime(impersonation.startedAt)}</strong>
+                    </span>
                   </p>
-                </div>
-                <div className="mt-4 space-y-2">
-                  <Link
-                    to="/"
-                    onClick={() => setMobileMenuOpen(false)}
-                    className="block px-3 py-2 rounded-lg text-sm font-medium bg-slate-900 text-white"
-                  >
-                    Beranda Dashboard
-                  </Link>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMobileMenuOpen(false);
-                      handleOpenSpec();
-                    }}
-                    className="w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100"
-                  >
-                    Spesifikasi OpenAPI v1
-                  </button>
                 </div>
               </div>
-              <Button
+              <button
                 type="button"
-                variant="outline"
+                disabled={stoppingImpersonation}
                 onClick={async () => {
-                  await logout();
-                  navigate('/login');
+                  setStoppingImpersonation(true);
+                  try {
+                    await stopImpersonation();
+                    toast.success('Sesi impersonasi diakhiri. Kembali ke akun Superadmin.');
+                    navigate('/admin/users');
+                  } catch (err: any) {
+                    toast.error(err?.message || 'Gagal kembali ke akun Superadmin.');
+                  } finally {
+                    setStoppingImpersonation(false);
+                  }
                 }}
+                className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-950 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-60 transition-colors shrink-0 cursor-pointer"
               >
-                <LogOut className="h-4 w-4" />
-                <span>Keluar Sesi</span>
-              </Button>
+                <ArrowLeft className="w-3.5 h-3.5" />
+                {stoppingImpersonation ? 'Memulihkan...' : 'Kembali ke Akun Superadmin'}
+              </button>
             </div>
           </div>
         )}
 
-        {/* Main Workspace Viewport */}
-        <main className="flex-1 px-6 py-8 max-w-[1360px] w-full mx-auto">
+        <GlobalTopbar
+          breadcrumb={breadcrumb}
+          primaryAction={primaryAction}
+          isCompact={isCompact}
+          onToggleCompact={() => setIsCompact((prev) => !prev)}
+          onOpenMobileMenu={() => setMobileMenuOpen(true)}
+          unreadCount={unreadCount}
+          onOpenNotifications={() => setNotifOpen(true)}
+        />
+
+        <main className="flex-1 w-full max-w-[1360px] mx-auto px-4 sm:px-6 lg:px-8 py-6">
           {children}
         </main>
 
-        {/* Quiet Institutional Footer */}
-        <footer className="border-t border-slate-200 bg-white px-6 py-4 text-xs text-slate-500">
-          <div className="max-w-[1360px] mx-auto flex flex-col sm:flex-row items-center justify-between gap-2">
+        <footer
+          className="border-t px-6 py-4 text-xs"
+          style={{
+            borderColor: 'var(--theme-border)',
+            backgroundColor: 'var(--theme-card-bg)',
+            color: 'var(--theme-text-secondary)',
+          }}
+        >
+          <div className="max-w-[1360px] mx-auto flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <span>
-              Politeknik Kampar — Sistem Manajemen Pembelajaran Digital Terpadu
+              {config.identity.institutionName} — {config.identity.applicationName}
             </span>
             <span>
-              Bangkinang, Kabupaten Kampar, Provinsi Riau · Tahun Akademik 2026/2027
+              {config.identity.copyrightText ||
+                `${config.identity.applicationBrand} · ${config.identity.institutionShortName}`}
             </span>
           </div>
         </footer>
@@ -433,19 +415,6 @@ export function AppShell({
             </Button>
           </div>
         )}
-      </ModalDialog>
-
-      {/* OpenAPI 3.1 Specification Viewer Modal */}
-      <ModalDialog
-        open={openApiModal}
-        onClose={() => setOpenApiModal(false)}
-        title="Dokumentasi OpenAPI 3.1 — REST API /api/v1"
-        description="Spesifikasi resmi endpoint backend Fastify, skema respons standar, dan skema keamanan."
-        maxWidth="max-w-3xl"
-      >
-        <pre className="rounded-lg bg-slate-950 p-4 text-xs font-mono text-slate-100 overflow-x-auto max-h-[60vh]">
-          {openApiJson}
-        </pre>
       </ModalDialog>
     </div>
   );

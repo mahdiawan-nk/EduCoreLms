@@ -14,6 +14,8 @@ import { AppShell } from '../components/AppShell';
 import { uploadMaterialAttachmentToS3, PresignedUploadResult } from '../lib/s3Upload';
 import { TiptapMaterialEditor, TiptapReadOnlyRenderer } from '../components/TiptapMaterialEditor';
 import { DocumentPreviewModal, formatBytes } from '../components/DocumentPreviewModal';
+import { ConfirmDialog } from '../components/ui/primitives';
+import { useDeleteConfirmation } from '../hooks/useDeleteConfirmation';
 
 interface UploadQueueItem {
   uid: string;
@@ -33,6 +35,7 @@ export function MaterialBuilderPage() {
   const initialTopicParam = searchParams.get('topicId') || '';
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const deleteConfirm = useDeleteConfirmation();
 
   const [activeMaterialId, setActiveMaterialId] = useState<string | null>(routeMaterialId || null);
   const [selectedClassroomId, setSelectedClassroomId] = useState<string>(classroomId || '');
@@ -472,19 +475,23 @@ export function MaterialBuilderPage() {
     }
   };
 
-  // Delete attachment
-  const handleDeleteAttachment = async (attachmentId: string) => {
-    try {
-      await apiFetch(`/api/v1/material-attachments/${attachmentId}`, {
-        method: 'DELETE',
-      });
-      setAttachments((prev) => prev.filter((a) => a.id !== attachmentId));
-    } catch (err: any) {
-      setFeedbackBanner({
-        type: 'error',
-        message: err.message || 'Gagal menghapus lampiran.',
-      });
-    }
+  // Delete attachment with confirmation modal
+  const handleDeleteAttachment = (attachmentId: string, fileName?: string) => {
+    deleteConfirm.requestConfirmation({
+      item: attachmentId,
+      title: 'Hapus Lampiran Materi?',
+      description: 'Apakah Anda yakin ingin menghapus berkas lampiran ini dari materi pembelajaran?',
+      itemName: fileName || 'Berkas Lampiran',
+      warningText: 'Berkas akan dihapus dari penyimpanan S3 dan tidak lagi tersedia untuk mahasiswa.',
+      actionLabel: 'Ya, Hapus Lampiran',
+      successMessage: 'Lampiran materi berhasil dihapus.',
+      onConfirm: async (id) => {
+        await apiFetch(`/api/v1/material-attachments/${id}`, {
+          method: 'DELETE',
+        });
+        setAttachments((prev) => prev.filter((a) => a.id !== id));
+      },
+    });
   };
 
   // Update attachment metadata (description / sortOrder)
@@ -644,18 +651,22 @@ export function MaterialBuilderPage() {
     }
   };
 
-  const handleDeleteVideo = async (videoId: string) => {
-    try {
-      await apiFetch(`/api/v1/material-videos/${videoId}`, {
-        method: 'DELETE',
-      });
-      setVideos((prev) => prev.filter((v) => v.id !== videoId));
-    } catch (err: any) {
-      setFeedbackBanner({
-        type: 'error',
-        message: err.message || 'Gagal menghapus video.',
-      });
-    }
+  const handleDeleteVideo = (videoId: string, videoTitle?: string) => {
+    deleteConfirm.requestConfirmation({
+      item: videoId,
+      title: 'Hapus Video Pembelajaran?',
+      description: 'Apakah Anda yakin ingin menghapus tautan/rekaman video ini dari materi?',
+      itemName: videoTitle || 'Video Pembelajaran',
+      warningText: 'Video akan dihapus dari daftar materi pembelajaran.',
+      actionLabel: 'Ya, Hapus Video',
+      successMessage: 'Video pembelajaran berhasil dihapus.',
+      onConfirm: async (id) => {
+        await apiFetch(`/api/v1/material-videos/${id}`, {
+          method: 'DELETE',
+        });
+        setVideos((prev) => prev.filter((v) => v.id !== id));
+      },
+    });
   };
 
   if (routeMaterialId && loadingExisting) {
@@ -1805,6 +1816,7 @@ export function MaterialBuilderPage() {
           allowDownload={enableDownloads}
         />
       )}
+      <ConfirmDialog {...deleteConfirm.dialogProps} />
       </div>
     </AppShell>
   );

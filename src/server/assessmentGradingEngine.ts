@@ -10,7 +10,8 @@ export type ObjectiveQuestionType =
   | 'ORDERING'
   | 'FILL_IN_BLANK'
   | 'SHORT_ANSWER'
-  | 'NUMERIC';
+  | 'NUMERIC'
+  | 'NUMERIC_TOLERANCE';
 
 export type EssayQuestionType =
   | 'SHORT_ESSAY'
@@ -237,7 +238,7 @@ export function buildQuestionSnapshots(params: {
     };
   }
 
-  if (qType === 'NUMERIC') {
+  if (qType === 'NUMERIC' || qType === 'NUMERIC_TOLERANCE') {
     return {
       studentOptionsSnapshot: {
         questionType: 'NUMERIC',
@@ -705,7 +706,7 @@ export function evaluateObjectiveQuestion(params: {
     };
   }
 
-  if (questionType === 'NUMERIC') {
+  if (questionType === 'NUMERIC' || questionType === 'NUMERIC_TOLERANCE') {
     const rawNum = Number(
       answerPayload.numericAnswer ?? answerPayload.value ?? answerPayload.text
     );

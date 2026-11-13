@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import {
   X, Download, ZoomIn, ZoomOut, RotateCcw, FileText, FileSpreadsheet,
   Presentation, Image as ImageIcon, Film, AlertTriangle, Loader2, CheckCircle2,
   ExternalLink
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import { useModalBehavior } from './ui/modalUtils';
 
 export interface PreviewAttachmentInfo {
   id: string;
@@ -78,6 +80,13 @@ export function DocumentPreviewModal({
   const [imageZoom, setImageZoom] = useState(100);
   const [playbackRate, setPlaybackRate] = useState(1);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+
+  useModalBehavior({
+    open: Boolean(open),
+    containerRef: dialogRef,
+    onClose,
+  });
 
   useEffect(() => {
     if (directAttachment && directPreview) {
@@ -147,9 +156,23 @@ export function DocumentPreviewModal({
     }
   };
 
-  return (
-    <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-xs flex items-center justify-center p-3 sm:p-6">
-      <div className="bg-white rounded-xl border border-slate-200 shadow-2xl w-full max-w-6xl h-[90vh] flex flex-col overflow-hidden">
+  if (!open || typeof document === 'undefined') return null;
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[1000] bg-slate-950/75 backdrop-blur-xs flex items-center justify-center p-3 sm:p-6 overflow-y-auto"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={displayName || 'Pratinjau Dokumen'}
+        tabIndex={-1}
+        className="bg-white rounded-xl border border-slate-200 shadow-2xl w-full max-w-6xl h-[calc(100dvh-1.5rem)] sm:h-[calc(100dvh-3rem)] my-auto flex flex-col overflow-hidden outline-none"
+      >
         {/* Header */}
         <div className="px-5 py-3.5 border-b border-slate-200 bg-slate-900 text-white flex items-center justify-between gap-4 shrink-0">
           <div className="flex items-center gap-3 min-w-0">
@@ -471,6 +494,7 @@ export function DocumentPreviewModal({
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

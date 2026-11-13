@@ -7,6 +7,9 @@ import {
   userProfiles,
   roles,
   userRoles,
+  permissions,
+  rolePermissions,
+  auditLogs,
   courses,
   semesters,
   classrooms,
@@ -35,7 +38,14 @@ import {
   sendError,
   recordAuditLog,
   AuthenticatedUser,
+  ensureRbacInitialized,
 } from './security.ts';
+import {
+  processAndOptimizeCoverImage,
+  removeCoverImageFiles,
+} from './imageOptimization.ts';
+import { resolvePrivateObjectPath } from './storage.ts';
+import { resolveClassroomRole, recordClassroomAudit } from './classroomWorkspaceRoutes.ts';
 
 // Role checking helper
 function isSuperadmin(user: AuthenticatedUser): boolean {
@@ -46,9 +56,11 @@ function isLecturerOrAdmin(user: AuthenticatedUser): boolean {
   return user.roles.some((r) => ['SUPERADMIN', 'DOSEN'].includes(r.toUpperCase()));
 }
 
-// Ensure default academic master seed exists
+// Ensure default academic master seed and RBAC permissions exist
 export async function ensureAcademicMasterSeeded(): Promise<void> {
   try {
+    await ensureRbacInitialized();
+
     const existingPeriods = await db.select().from(academicPeriods);
     let defaultPeriodId: string;
 
@@ -67,82 +79,19 @@ export async function ensureAcademicMasterSeeded(): Promise<void> {
           name: 'Semester Ganjil 2026/2027',
           academicYear: '2026/2027',
           semesterType: 'ODD',
+          description: 'Periode akademik resmi Semester Ganjil Tahun Akademik 2026/2027 Politeknik Kampar.',
+          preparationStartDate: new Date('2026-08-15T00:00:00Z'),
           startDate: new Date('2026-09-01T00:00:00Z'),
           endDate: new Date('2027-01-31T23:59:59Z'),
-          registrationStart: new Date('2026-08-01T00:00:00Z'),
-          registrationEnd: new Date('2026-09-15T23:59:59Z'),
-          status: 'active',
+          status: 'ACTIVE',
           isDefault: true,
+          administrativeNotes: 'Semester aktif utama perkuliahan reguler Politeknik Kampar.',
           createdById: adminId,
-          metadata: { notes: 'Periode Perkuliahan Reguler Kampus Politeknik Kampar' },
+          metadata: { everActivated: true, notes: 'Periode Perkuliahan Reguler Kampus Politeknik Kampar' },
         })
         .returning();
 
       defaultPeriodId = period.id;
-
-      // Seed Academic Calendar Events
-      await db.insert(academicCalendarEvents).values([
-        {
-          academicPeriodId: defaultPeriodId,
-          title: 'Masa Pengisian Kartu Rencana Studi (KRS)',
-          description: 'Pendaftaran kelas perkuliahan mandiri mahasiswa di Politeknik Kampar',
-          category: 'KRS_REGISTRATION',
-          startDate: new Date('2026-08-01T08:00:00Z'),
-          endDate: new Date('2026-08-25T17:00:00Z'),
-          isHoliday: false,
-          visibility: 'ALL',
-          color: '#2563eb',
-          createdById: adminId,
-        },
-        {
-          academicPeriodId: defaultPeriodId,
-          title: 'Awal Perkuliahan Semester Ganjil 2026/2027',
-          description: 'Kuliah perdana tatap muka dan digital classroom',
-          category: 'LECTURE_START',
-          startDate: new Date('2026-09-01T07:30:00Z'),
-          endDate: new Date('2026-09-01T17:00:00Z'),
-          isHoliday: false,
-          visibility: 'ALL',
-          color: '#16a34a',
-          createdById: adminId,
-        },
-        {
-          academicPeriodId: defaultPeriodId,
-          title: 'Ujian Tengah Semester (UTS) Ganjil',
-          description: 'Pekan evaluasi tengah semester terpadu',
-          category: 'UTS',
-          startDate: new Date('2026-10-26T08:00:00Z'),
-          endDate: new Date('2026-11-06T17:00:00Z'),
-          isHoliday: false,
-          visibility: 'ALL',
-          color: '#ea580c',
-          createdById: adminId,
-        },
-        {
-          academicPeriodId: defaultPeriodId,
-          title: 'Ujian Akhir Semester (UAS) Ganjil',
-          description: 'Pekan evaluasi akhir semester dan sidang praktikum',
-          category: 'UAS',
-          startDate: new Date('2027-01-11T08:00:00Z'),
-          endDate: new Date('2027-01-22T17:00:00Z'),
-          isHoliday: false,
-          visibility: 'ALL',
-          color: '#dc2626',
-          createdById: adminId,
-        },
-        {
-          academicPeriodId: defaultPeriodId,
-          title: 'Batas Akhir Finalisasi Nilai Akademik',
-          description: 'Batas akhir input dan penguncian nilai oleh Dosen Pengampu',
-          category: 'GRADE_SUBMISSION',
-          startDate: new Date('2027-01-25T08:00:00Z'),
-          endDate: new Date('2027-01-31T23:59:59Z'),
-          isHoliday: false,
-          visibility: 'LECTURER_ONLY',
-          color: '#7c3aed',
-          createdById: adminId,
-        },
-      ]);
 
       // Seed Campus Buildings
       const [gdu, glt] = await db
@@ -222,6 +171,42 @@ export async function ensureAcademicMasterSeeded(): Promise<void> {
             maxClassrooms: 4,
             createdById: adminId,
           }).onConflictDoNothing();
+        }
+      }
+    } else {
+      // If periods exist but courseOfferings are not yet seeded, populate from master courses
+      const existingOfferings = await db.select().from(courseOfferings);
+      if (existingOfferings.length === 0) {
+        const defaultPeriods = await db
+          .select()
+          .from(academicPeriods)
+          .where(eq(academicPeriods.isDefault, true));
+        const targetPeriod = defaultPeriods[0] || existingPeriods[0];
+        const existingCourses = await db.select().from(courses);
+        if (targetPeriod && existingCourses.length > 0) {
+          const superadminRows = await db
+            .select()
+            .from(users)
+            .where(ilike(users.email, 'superadmin%'));
+          const adminId = superadminRows[0]?.id || null;
+          for (const c of existingCourses) {
+            await db
+              .insert(courseOfferings)
+              .values({
+                courseId: c.id,
+                academicPeriodId: targetPeriod.id,
+                studyProgram: c.studyProgram || 'Teknik Informatika',
+                courseCode: c.code,
+                courseName: c.title,
+                theoryCredits: 2,
+                practicalCredits: 1,
+                totalCredits: c.credits || 3,
+                offeringStatus: 'OFFERED',
+                maxClassrooms: 4,
+                createdById: adminId,
+              })
+              .onConflictDoNothing();
+          }
         }
       }
     }
@@ -337,12 +322,14 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
   });
 
   // ============================================================================
-  // MODULE A: ACADEMIC PERIOD MANAGEMENT
+  // MODULE A: ACADEMIC PERIOD MANAGEMENT (PURE SEMESTER CRUD & RBAC)
   // ============================================================================
 
   // Public/Lecturer endpoint: Get currently active default academic period
   fastify.get('/api/v1/academic-periods/default', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
+    const user = await authenticateRequest(req, reply, {
+      requiredPermissions: ['academic_period.view'],
+    });
     if (!user) return;
 
     const [defaultPeriod] = await db
@@ -356,7 +343,7 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
       const [latest] = await db
         .select()
         .from(academicPeriods)
-        .where(eq(academicPeriods.status, 'active'))
+        .where(eq(academicPeriods.status, 'ACTIVE'))
         .orderBy(desc(academicPeriods.startDate))
         .limit(1);
 
@@ -366,33 +353,53 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
     return sendSuccess(reply, defaultPeriod);
   });
 
-  // Superadmin: List all academic periods
-  fastify.get('/api/v1/admin/academic-periods', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
+  // Handler for listing all academic periods with enrichment
+  const listAcademicPeriodsHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+    const user = await authenticateRequest(req, reply, {
+      requiredPermissions: ['academic_period.view'],
+    });
     if (!user) return;
 
-    if (!isSuperadmin(user)) {
-      return sendError(reply, 403, 'FORBIDDEN', 'Hanya Superadmin yang berwenang mengelola master Periode Akademik.');
-    }
+    const query = req.query as {
+      status?: string;
+      search?: string;
+      academicYear?: string;
+      semesterType?: string;
+      sortBy?: string;
+      sortOrder?: string;
+      page?: string;
+      limit?: string;
+    };
 
-    const query = req.query as { status?: string; search?: string };
     const all = await db
       .select()
       .from(academicPeriods)
       .orderBy(desc(academicPeriods.startDate));
 
     let filtered = all;
+
     if (query.status && query.status !== 'all') {
-      filtered = filtered.filter((p) => p.status === query.status);
+      const qStatus = query.status.toUpperCase();
+      filtered = filtered.filter((p) => p.status.toUpperCase() === qStatus);
+    }
+    if (query.academicYear && query.academicYear !== 'all') {
+      filtered = filtered.filter((p) => p.academicYear === query.academicYear);
+    }
+    if (query.semesterType && query.semesterType !== 'all') {
+      const qSemType = query.semesterType.toUpperCase();
+      filtered = filtered.filter((p) => p.semesterType.toUpperCase() === qSemType);
     }
     if (query.search) {
-      const q = query.search.toLowerCase();
+      const q = query.search.toLowerCase().trim();
       filtered = filtered.filter(
-        (p) => p.name.toLowerCase().includes(q) || p.code.toLowerCase().includes(q) || p.academicYear.toLowerCase().includes(q)
+        (p) =>
+          p.name.toLowerCase().includes(q) ||
+          p.code.toLowerCase().includes(q) ||
+          p.academicYear.toLowerCase().includes(q)
       );
     }
 
-    // Attach count of classrooms and offerings
+    // Attach count of active classrooms and course offerings
     const enriched = await Promise.all(
       filtered.map(async (period) => {
         const clsList = await db
@@ -412,41 +419,181 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
       })
     );
 
-    return sendSuccess(reply, enriched);
-  });
+    // Sorting
+    const sortBy = query.sortBy || 'startDate';
+    const sortOrder = (query.sortOrder || 'desc').toLowerCase();
+    enriched.sort((a: any, b: any) => {
+      let valA = a[sortBy];
+      let valB = b[sortBy];
+      if (valA instanceof Date) valA = valA.getTime();
+      if (valB instanceof Date) valB = valB.getTime();
+      if (typeof valA === 'string') valA = valA.toLowerCase();
+      if (typeof valB === 'string') valB = valB.toLowerCase();
+      if (valA < valB) return sortOrder === 'asc' ? -1 : 1;
+      if (valA > valB) return sortOrder === 'asc' ? 1 : -1;
+      return 0;
+    });
 
-  // Superadmin: Create new Academic Period
+    // Pagination
+    const page = parseInt(query.page || '1', 10);
+    const limit = parseInt(query.limit || '50', 10);
+    const total = enriched.length;
+    const startIndex = (page - 1) * limit;
+    const paginated = enriched.slice(startIndex, startIndex + limit);
+
+    return sendSuccess(reply, paginated, {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    });
+  };
+
+  // Mount list endpoints for both admin and public prefix
+  fastify.get('/api/v1/admin/academic-periods', listAcademicPeriodsHandler);
+  fastify.get('/api/v1/academic-periods', listAcademicPeriodsHandler);
+
+  // Detail endpoint handler
+  const getAcademicPeriodDetailHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+    const user = await authenticateRequest(req, reply, {
+      requiredPermissions: ['academic_period.view'],
+    });
+    if (!user) return;
+
+    const { id } = req.params as { id: string };
+    const [period] = await db
+      .select()
+      .from(academicPeriods)
+      .where(eq(academicPeriods.id, id));
+
+    if (!period) {
+      return sendError(reply, 404, 'NOT_FOUND', 'Periode akademik tidak ditemukan.');
+    }
+
+    const clsList = await db
+      .select({ id: classrooms.id })
+      .from(classrooms)
+      .where(eq(classrooms.academicPeriodId, period.id));
+    const offeringList = await db
+      .select({ id: courseOfferings.id })
+      .from(courseOfferings)
+      .where(eq(courseOfferings.academicPeriodId, period.id));
+
+    return sendSuccess(reply, {
+      ...period,
+      classroomCount: clsList.length,
+      courseOfferingCount: offeringList.length,
+    });
+  };
+
+  fastify.get('/api/v1/admin/academic-periods/:id', getAcademicPeriodDetailHandler);
+  fastify.get('/api/v1/academic-periods/:id', getAcademicPeriodDetailHandler);
+
+  // Superadmin: Create new Academic Period (Pure Semester)
   const createAcademicPeriodSchema = z.object({
-    code: z.string().min(3).max(20),
-    name: z.string().min(5),
-    academicYear: z.string().min(7), // e.g., "2026/2027"
-    semesterType: z.enum(['ODD', 'EVEN', 'SHORT']),
-    startDate: z.string(),
-    endDate: z.string(),
-    registrationStart: z.string(),
-    registrationEnd: z.string(),
-    status: z.enum(['draft', 'scheduled', 'active', 'registration_closed', 'completed', 'archived']).default('draft'),
-    isDefault: z.boolean().default(false),
+    academic_code: z.string().min(3).max(30).optional(),
+    code: z.string().min(3).max(30).optional(),
+    name: z.string().min(3).max(150),
+    academic_year: z.string().min(4).max(20).optional(),
+    academicYear: z.string().min(4).max(20).optional(),
+    semester_type: z.string().optional(),
+    semesterType: z.string().optional(),
+    description: z.string().optional().default(''),
+    preparation_start_date: z.string().nullable().optional(),
+    preparationStartDate: z.string().nullable().optional(),
+    lecture_start_date: z.string().optional(),
+    startDate: z.string().optional(),
+    lecture_end_date: z.string().optional(),
+    endDate: z.string().optional(),
+    is_default: z.boolean().optional(),
+    isDefault: z.boolean().optional(),
+    status: z.string().optional().default('DRAFT'),
+    administrative_notes: z.string().optional().default(''),
+    administrativeNotes: z.string().optional().default(''),
     metadata: z.record(z.string(), z.unknown()).optional(),
   });
 
   fastify.post('/api/v1/admin/academic-periods', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
+    const user = await authenticateRequest(req, reply, {
+      requiredPermissions: ['academic_period.create'],
+    });
     if (!user) return;
-    if (!isSuperadmin(user)) {
-      return sendError(reply, 403, 'FORBIDDEN', 'Hanya Superadmin yang berwenang menambah Periode Akademik.');
-    }
 
     const parsed = createAcademicPeriodSchema.safeParse(req.body);
     if (!parsed.success) {
-      return sendError(reply, 400, 'VALIDATION_ERROR', 'Data periode akademik tidak valid.', parsed.error.issues);
+      return sendError(
+        reply,
+        400,
+        'VALIDATION_ERROR',
+        'Data periode akademik tidak valid.',
+        parsed.error.issues
+      );
     }
 
-    const { code, name, academicYear, semesterType, startDate, endDate, registrationStart, registrationEnd, status, isDefault, metadata } = parsed.data;
+    const data = parsed.data;
+    const code = (data.code || data.academic_code)?.trim();
+    if (!code) {
+      return sendError(reply, 400, 'VALIDATION_ERROR', 'Kode periode akademik (academic_code) wajib diisi.');
+    }
+
+    const academicYear = (data.academicYear || data.academic_year)?.trim();
+    if (!academicYear) {
+      return sendError(reply, 400, 'VALIDATION_ERROR', 'Tahun akademik (academic_year) wajib diisi.');
+    }
+
+    const rawSemesterType = (data.semesterType || data.semester_type)?.trim().toUpperCase();
+    if (!rawSemesterType || !['ODD', 'EVEN', 'SHORT'].includes(rawSemesterType)) {
+      return sendError(reply, 400, 'VALIDATION_ERROR', 'Tipe semester harus ODD, EVEN, atau SHORT.');
+    }
+    const semesterType = rawSemesterType as 'ODD' | 'EVEN' | 'SHORT';
+
+    const rawStartDate = data.startDate || data.lecture_start_date;
+    const rawEndDate = data.endDate || data.lecture_end_date;
+    if (!rawStartDate || !rawEndDate) {
+      return sendError(reply, 400, 'VALIDATION_ERROR', 'Tanggal mulai dan selesai perkuliahan wajib diisi.');
+    }
+
+    const startDate = new Date(rawStartDate);
+    const endDate = new Date(rawEndDate);
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      return sendError(reply, 400, 'INVALID_DATES', 'Format tanggal perkuliahan tidak valid.');
+    }
+    if (startDate >= endDate) {
+      return sendError(reply, 400, 'INVALID_DATE_RANGE', 'Tanggal mulai perkuliahan harus lebih awal dari tanggal selesai perkuliahan.');
+    }
+
+    let prepDate: Date | null = null;
+    const rawPrep = data.preparationStartDate || data.preparation_start_date;
+    if (rawPrep) {
+      prepDate = new Date(rawPrep);
+      if (isNaN(prepDate.getTime())) {
+        return sendError(reply, 400, 'INVALID_DATES', 'Format tanggal persiapan tidak valid.');
+      }
+    }
+
+    const rawStatus = (data.status || 'DRAFT').trim().toUpperCase();
+    if (!['DRAFT', 'SCHEDULED', 'ACTIVE', 'COMPLETED', 'ARCHIVED'].includes(rawStatus)) {
+      return sendError(reply, 400, 'VALIDATION_ERROR', 'Status periode tidak valid (DRAFT, SCHEDULED, ACTIVE, COMPLETED, ARCHIVED).');
+    }
+    const status = rawStatus;
+
+    const isDefault = data.isDefault ?? data.is_default ?? false;
+    const description = data.description || '';
+    const administrativeNotes = data.administrativeNotes || data.administrative_notes || '';
+
+    // Check code uniqueness
+    const [existingCode] = await db
+      .select({ id: academicPeriods.id })
+      .from(academicPeriods)
+      .where(eq(academicPeriods.code, code))
+      .limit(1);
+
+    if (existingCode) {
+      return sendError(reply, 409, 'CODE_EXISTS', `Kode periode akademik "${code}" sudah terdaftar.`);
+    }
 
     try {
       const result = await db.transaction(async (tx) => {
-        // If isDefault is true, unset default on all other periods
         if (isDefault) {
           await tx
             .update(academicPeriods)
@@ -457,17 +604,21 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
           .insert(academicPeriods)
           .values({
             code,
-            name,
+            name: data.name.trim(),
             academicYear,
             semesterType,
-            startDate: new Date(startDate),
-            endDate: new Date(endDate),
-            registrationStart: new Date(registrationStart),
-            registrationEnd: new Date(registrationEnd),
+            description,
+            preparationStartDate: prepDate,
+            startDate,
+            endDate,
             status,
             isDefault,
+            administrativeNotes,
             createdById: user.id,
-            metadata: metadata || {},
+            metadata: {
+              ...(data.metadata || {}),
+              everActivated: status === 'ACTIVE',
+            },
           })
           .returning();
 
@@ -479,65 +630,173 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
         action: 'ACADEMIC_PERIOD_CREATED',
         entityType: 'ACADEMIC_PERIOD',
         entityId: result.id,
-        metadata: { code, name, academicYear },
+        metadata: {
+          code: result.code,
+          name: result.name,
+          academicYear: result.academicYear,
+          status: result.status,
+          isDefault: result.isDefault,
+        },
         ipAddress: req.ip,
       });
 
       return sendSuccess(reply, result, null, 201);
     } catch (err: any) {
       console.error('Create academic period failed:', err);
-      return sendError(reply, 409, 'CODE_EXISTS', 'Kode periode akademik sudah terdaftar.');
+      return sendError(reply, 500, 'CREATE_PERIOD_FAILED', err.message || 'Gagal menyimpan periode akademik.');
     }
   });
 
   // Superadmin: Update Academic Period
+  const updateAcademicPeriodSchema = z.object({
+    academic_code: z.string().min(3).max(30).optional(),
+    code: z.string().min(3).max(30).optional(),
+    name: z.string().min(3).max(150).optional(),
+    academic_year: z.string().min(4).max(20).optional(),
+    academicYear: z.string().min(4).max(20).optional(),
+    semester_type: z.string().optional(),
+    semesterType: z.string().optional(),
+    description: z.string().optional(),
+    preparation_start_date: z.string().nullable().optional(),
+    preparationStartDate: z.string().nullable().optional(),
+    lecture_start_date: z.string().optional(),
+    startDate: z.string().optional(),
+    lecture_end_date: z.string().optional(),
+    endDate: z.string().optional(),
+    is_default: z.boolean().optional(),
+    isDefault: z.boolean().optional(),
+    status: z.string().optional(),
+    administrative_notes: z.string().optional(),
+    administrativeNotes: z.string().optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+  });
+
   fastify.patch('/api/v1/admin/academic-periods/:id', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
+    const user = await authenticateRequest(req, reply, {
+      requiredPermissions: ['academic_period.update'],
+    });
     if (!user) return;
-    if (!isSuperadmin(user)) {
-      return sendError(reply, 403, 'FORBIDDEN', 'Hanya Superadmin yang berwenang memperbarui Periode Akademik.');
-    }
 
     const { id } = req.params as { id: string };
-    const [period] = await db.select().from(academicPeriods).where(eq(academicPeriods.id, id));
+    const [period] = await db
+      .select()
+      .from(academicPeriods)
+      .where(eq(academicPeriods.id, id));
+
     if (!period) {
       return sendError(reply, 404, 'NOT_FOUND', 'Periode akademik tidak ditemukan.');
     }
 
-    const updateSchema = z.object({
-      name: z.string().optional(),
-      academicYear: z.string().optional(),
-      semesterType: z.enum(['ODD', 'EVEN', 'SHORT']).optional(),
-      startDate: z.string().optional(),
-      endDate: z.string().optional(),
-      registrationStart: z.string().optional(),
-      registrationEnd: z.string().optional(),
-      status: z.enum(['draft', 'scheduled', 'active', 'registration_closed', 'completed', 'archived']).optional(),
-      isDefault: z.boolean().optional(),
-      metadata: z.record(z.string(), z.unknown()).optional(),
-    });
+    // Rule 6: Archived semesters are read-only
+    if (period.status.toUpperCase() === 'ARCHIVED') {
+      return sendError(
+        reply,
+        400,
+        'PERIOD_ARCHIVED',
+        'Periode akademik yang telah diarsipkan bersifat read-only dan tidak dapat diubah.'
+      );
+    }
 
-    const parsed = updateSchema.safeParse(req.body);
+    const parsed = updateAcademicPeriodSchema.safeParse(req.body);
     if (!parsed.success) {
       return sendError(reply, 400, 'VALIDATION_ERROR', 'Format perbaruan tidak valid.', parsed.error.issues);
     }
 
+    const data = parsed.data;
     const updates: any = { updatedAt: new Date() };
-    if (parsed.data.name !== undefined) updates.name = parsed.data.name;
-    if (parsed.data.academicYear !== undefined) updates.academicYear = parsed.data.academicYear;
-    if (parsed.data.semesterType !== undefined) updates.semesterType = parsed.data.semesterType;
-    if (parsed.data.startDate !== undefined) updates.startDate = new Date(parsed.data.startDate);
-    if (parsed.data.endDate !== undefined) updates.endDate = new Date(parsed.data.endDate);
-    if (parsed.data.registrationStart !== undefined) updates.registrationStart = new Date(parsed.data.registrationStart);
-    if (parsed.data.registrationEnd !== undefined) updates.registrationEnd = new Date(parsed.data.registrationEnd);
-    if (parsed.data.status !== undefined) updates.status = parsed.data.status;
-    if (parsed.data.metadata !== undefined) updates.metadata = parsed.data.metadata;
+
+    // Code update & uniqueness check
+    const newCode = (data.code || data.academic_code)?.trim();
+    if (newCode && newCode !== period.code) {
+      const [codeCheck] = await db
+        .select({ id: academicPeriods.id })
+        .from(academicPeriods)
+        .where(eq(academicPeriods.code, newCode))
+        .limit(1);
+      if (codeCheck) {
+        return sendError(reply, 409, 'CODE_EXISTS', `Kode periode akademik "${newCode}" sudah digunakan.`);
+      }
+      updates.code = newCode;
+    }
+
+    if (data.name !== undefined) updates.name = data.name.trim();
+
+    const newYear = (data.academicYear || data.academic_year)?.trim();
+    if (newYear) updates.academicYear = newYear;
+
+    const rawSemType = (data.semesterType || data.semester_type)?.trim().toUpperCase();
+    if (rawSemType) {
+      if (!['ODD', 'EVEN', 'SHORT'].includes(rawSemType)) {
+        return sendError(reply, 400, 'VALIDATION_ERROR', 'Tipe semester harus ODD, EVEN, atau SHORT.');
+      }
+      updates.semesterType = rawSemType;
+    }
+
+    if (data.description !== undefined) updates.description = data.description;
+    if (data.administrativeNotes !== undefined || data.administrative_notes !== undefined) {
+      updates.administrativeNotes = data.administrativeNotes ?? data.administrative_notes;
+    }
+
+    // Dates validation
+    const rawStart = data.startDate || data.lecture_start_date;
+    const rawEnd = data.endDate || data.lecture_end_date;
+    const targetStartDate = rawStart ? new Date(rawStart) : period.startDate;
+    const targetEndDate = rawEnd ? new Date(rawEnd) : period.endDate;
+
+    if (isNaN(targetStartDate.getTime()) || isNaN(targetEndDate.getTime())) {
+      return sendError(reply, 400, 'INVALID_DATES', 'Format tanggal perkuliahan tidak valid.');
+    }
+    if (targetStartDate >= targetEndDate) {
+      return sendError(reply, 400, 'INVALID_DATE_RANGE', 'Tanggal mulai perkuliahan harus lebih awal dari tanggal selesai perkuliahan.');
+    }
+    if (rawStart) updates.startDate = targetStartDate;
+    if (rawEnd) updates.endDate = targetEndDate;
+
+    const rawPrep = data.preparationStartDate !== undefined ? data.preparationStartDate : data.preparation_start_date;
+    if (rawPrep !== undefined) {
+      updates.preparationStartDate = rawPrep ? new Date(rawPrep) : null;
+    }
+
+    // Lifecycle Status Transition Validation
+    if (data.status) {
+      const nextStatus = data.status.trim().toUpperCase();
+      const currentStatus = period.status.toUpperCase();
+      if (!['DRAFT', 'SCHEDULED', 'ACTIVE', 'COMPLETED', 'ARCHIVED'].includes(nextStatus)) {
+        return sendError(reply, 400, 'VALIDATION_ERROR', 'Status tidak valid.');
+      }
+
+      if (currentStatus !== nextStatus) {
+        const allowedTransitions: Record<string, string[]> = {
+          DRAFT: ['SCHEDULED', 'ACTIVE'],
+          SCHEDULED: ['DRAFT', 'ACTIVE'],
+          ACTIVE: ['COMPLETED'],
+          COMPLETED: ['ARCHIVED'],
+          ARCHIVED: [],
+        };
+
+        if (!allowedTransitions[currentStatus]?.includes(nextStatus)) {
+          return sendError(
+            reply,
+            400,
+            'INVALID_STATUS_TRANSITION',
+            `Transisi status dari ${currentStatus} ke ${nextStatus} tidak diperbolehkan.`
+          );
+        }
+
+        updates.status = nextStatus;
+        if (nextStatus === 'ACTIVE') {
+          updates.metadata = { ...(period.metadata as any || {}), everActivated: true };
+        }
+      }
+    }
+
+    const isDefaultParam = data.isDefault !== undefined ? data.isDefault : data.is_default;
 
     const result = await db.transaction(async (tx) => {
-      if (parsed.data.isDefault === true) {
+      if (isDefaultParam === true) {
         await tx.update(academicPeriods).set({ isDefault: false, updatedAt: new Date() });
         updates.isDefault = true;
-      } else if (parsed.data.isDefault === false) {
+      } else if (isDefaultParam === false) {
         updates.isDefault = false;
       }
 
@@ -549,82 +808,377 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
       return updated;
     });
 
+    await recordAuditLog({
+      actorId: user.id,
+      action: 'ACADEMIC_PERIOD_UPDATED',
+      entityType: 'ACADEMIC_PERIOD',
+      entityId: id,
+      metadata: {
+        previousValues: {
+          code: period.code,
+          name: period.name,
+          academicYear: period.academicYear,
+          status: period.status,
+          isDefault: period.isDefault,
+        },
+        newValues: {
+          code: result.code,
+          name: result.name,
+          academicYear: result.academicYear,
+          status: result.status,
+          isDefault: result.isDefault,
+        },
+      },
+      ipAddress: req.ip,
+    });
+
     return sendSuccess(reply, result);
   });
 
-  // State Transition Endpoints
-  fastify.post('/api/v1/admin/academic-periods/:id/activate', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user || !isSuperadmin(user)) return sendError(reply, 403, 'FORBIDDEN', 'Superadmin only');
+  // Superadmin: Delete Academic Period (Strict eligibility checks)
+  fastify.delete('/api/v1/admin/academic-periods/:id', async (req, reply) => {
+    const user = await authenticateRequest(req, reply, {
+      requiredPermissions: ['academic_period.delete'],
+    });
+    if (!user) return;
+
     const { id } = req.params as { id: string };
+    const [period] = await db
+      .select()
+      .from(academicPeriods)
+      .where(eq(academicPeriods.id, id));
 
-    const [updated] = await db
-      .update(academicPeriods)
-      .set({ status: 'active', updatedAt: new Date() })
-      .where(eq(academicPeriods.id, id))
-      .returning();
+    if (!period) {
+      return sendError(reply, 404, 'NOT_FOUND', 'Periode akademik tidak ditemukan.');
+    }
 
-    return sendSuccess(reply, updated);
+    // 1. Dependency check: Classrooms
+    const clsList = await db
+      .select({ id: classrooms.id })
+      .from(classrooms)
+      .where(eq(classrooms.academicPeriodId, id));
+    if (clsList.length > 0) {
+      return sendError(
+        reply,
+        400,
+        'PERIOD_HAS_DEPENDENCIES',
+        `Periode akademik tidak dapat dihapus karena memiliki ${clsList.length} ruang kelas aktif/terdaftar.`
+      );
+    }
+
+    // 2. Dependency check: Course Offerings
+    const offeringList = await db
+      .select({ id: courseOfferings.id })
+      .from(courseOfferings)
+      .where(eq(courseOfferings.academicPeriodId, id));
+    if (offeringList.length > 0) {
+      return sendError(
+        reply,
+        400,
+        'PERIOD_HAS_DEPENDENCIES',
+        `Periode akademik tidak dapat dihapus karena memiliki ${offeringList.length} penawaran mata kuliah terkait.`
+      );
+    }
+
+    // 3. Activation history check: Never activated
+    const currentStatus = period.status.toUpperCase();
+    const wasActivated =
+      ['ACTIVE', 'COMPLETED', 'ARCHIVED'].includes(currentStatus) ||
+      (period.metadata as any)?.everActivated === true;
+
+    const [activationLog] = await db
+      .select({ id: auditLogs.id })
+      .from(auditLogs)
+      .where(
+        and(
+          eq(auditLogs.entityType, 'ACADEMIC_PERIOD'),
+          eq(auditLogs.entityId, id),
+          eq(auditLogs.action, 'ACADEMIC_PERIOD_ACTIVATED')
+        )
+      )
+      .limit(1);
+
+    if (wasActivated || activationLog) {
+      return sendError(
+        reply,
+        400,
+        'PERIOD_ALREADY_ACTIVATED',
+        'Periode akademik tidak dapat dihapus karena telah pernah diaktifkan dalam siklus perkuliahan Politeknik Kampar.'
+      );
+    }
+
+    await db.delete(academicPeriods).where(eq(academicPeriods.id, id));
+
+    await recordAuditLog({
+      actorId: user.id,
+      action: 'ACADEMIC_PERIOD_DELETED',
+      entityType: 'ACADEMIC_PERIOD',
+      entityId: id,
+      metadata: {
+        previousValues: {
+          code: period.code,
+          name: period.name,
+          academicYear: period.academicYear,
+          status: period.status,
+        },
+      },
+      ipAddress: req.ip,
+    });
+
+    return sendSuccess(reply, { deleted: true, id });
   });
 
-  fastify.post('/api/v1/admin/academic-periods/:id/close-registration', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user || !isSuperadmin(user)) return sendError(reply, 403, 'FORBIDDEN', 'Superadmin only');
+  // State Transition Endpoints (Explicitly Authorized Lifecycle Management)
+  fastify.post('/api/v1/admin/academic-periods/:id/activate', async (req, reply) => {
+    const user = await authenticateRequest(req, reply, {
+      requiredPermissions: ['academic_period.activate'],
+    });
+    if (!user) return;
+
     const { id } = req.params as { id: string };
+    const [period] = await db
+      .select()
+      .from(academicPeriods)
+      .where(eq(academicPeriods.id, id));
+
+    if (!period) {
+      return sendError(reply, 404, 'NOT_FOUND', 'Periode akademik tidak ditemukan.');
+    }
+
+    const currentStatus = period.status.toUpperCase();
+    if (['COMPLETED', 'ARCHIVED'].includes(currentStatus)) {
+      return sendError(
+        reply,
+        400,
+        'INVALID_STATUS_TRANSITION',
+        `Periode akademik dengan status ${currentStatus} tidak dapat diaktifkan kembali.`
+      );
+    }
 
     const [updated] = await db
       .update(academicPeriods)
-      .set({ status: 'registration_closed', updatedAt: new Date() })
+      .set({
+        status: 'ACTIVE',
+        metadata: { ...(period.metadata as any || {}), everActivated: true },
+        updatedAt: new Date(),
+      })
       .where(eq(academicPeriods.id, id))
       .returning();
+
+    await recordAuditLog({
+      actorId: user.id,
+      action: 'ACADEMIC_PERIOD_ACTIVATED',
+      entityType: 'ACADEMIC_PERIOD',
+      entityId: id,
+      metadata: {
+        previousValues: { status: period.status },
+        newValues: { status: 'ACTIVE' },
+      },
+      ipAddress: req.ip,
+    });
 
     return sendSuccess(reply, updated);
   });
 
   fastify.post('/api/v1/admin/academic-periods/:id/complete', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user || !isSuperadmin(user)) return sendError(reply, 403, 'FORBIDDEN', 'Superadmin only');
+    const user = await authenticateRequest(req, reply, {
+      requiredPermissions: ['academic_period.complete'],
+    });
+    if (!user) return;
+
     const { id } = req.params as { id: string };
+    const [period] = await db
+      .select()
+      .from(academicPeriods)
+      .where(eq(academicPeriods.id, id));
+
+    if (!period) {
+      return sendError(reply, 404, 'NOT_FOUND', 'Periode akademik tidak ditemukan.');
+    }
+
+    const currentStatus = period.status.toUpperCase();
+    if (currentStatus !== 'ACTIVE') {
+      return sendError(
+        reply,
+        400,
+        'INVALID_STATUS_TRANSITION',
+        `Hanya periode akademik berstatus ACTIVE yang dapat diselesaikan (status saat ini: ${currentStatus}).`
+      );
+    }
 
     const [updated] = await db
       .update(academicPeriods)
-      .set({ status: 'completed', isDefault: false, updatedAt: new Date() })
+      .set({ status: 'COMPLETED', isDefault: false, updatedAt: new Date() })
       .where(eq(academicPeriods.id, id))
       .returning();
+
+    await recordAuditLog({
+      actorId: user.id,
+      action: 'ACADEMIC_PERIOD_COMPLETED',
+      entityType: 'ACADEMIC_PERIOD',
+      entityId: id,
+      metadata: {
+        previousValues: { status: period.status },
+        newValues: { status: 'COMPLETED' },
+      },
+      ipAddress: req.ip,
+    });
 
     return sendSuccess(reply, updated);
   });
 
   fastify.post('/api/v1/admin/academic-periods/:id/archive', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user || !isSuperadmin(user)) return sendError(reply, 403, 'FORBIDDEN', 'Superadmin only');
+    const user = await authenticateRequest(req, reply, {
+      requiredPermissions: ['academic_period.archive'],
+    });
+    if (!user) return;
+
     const { id } = req.params as { id: string };
+    const [period] = await db
+      .select()
+      .from(academicPeriods)
+      .where(eq(academicPeriods.id, id));
+
+    if (!period) {
+      return sendError(reply, 404, 'NOT_FOUND', 'Periode akademik tidak ditemukan.');
+    }
+
+    const currentStatus = period.status.toUpperCase();
+    if (currentStatus !== 'COMPLETED') {
+      return sendError(
+        reply,
+        400,
+        'INVALID_STATUS_TRANSITION',
+        `Hanya periode akademik berstatus COMPLETED yang dapat diarsipkan (status saat ini: ${currentStatus}).`
+      );
+    }
 
     const [updated] = await db
       .update(academicPeriods)
-      .set({ status: 'archived', isDefault: false, updatedAt: new Date() })
+      .set({ status: 'ARCHIVED', isDefault: false, updatedAt: new Date() })
       .where(eq(academicPeriods.id, id))
       .returning();
+
+    await recordAuditLog({
+      actorId: user.id,
+      action: 'ACADEMIC_PERIOD_ARCHIVED',
+      entityType: 'ACADEMIC_PERIOD',
+      entityId: id,
+      metadata: {
+        previousValues: { status: period.status },
+        newValues: { status: 'ARCHIVED' },
+      },
+      ipAddress: req.ip,
+    });
 
     return sendSuccess(reply, updated);
   });
 
   fastify.post('/api/v1/admin/academic-periods/:id/set-default', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user || !isSuperadmin(user)) return sendError(reply, 403, 'FORBIDDEN', 'Superadmin only');
+    const user = await authenticateRequest(req, reply, {
+      requiredPermissions: ['academic_period.set_default'],
+    });
+    if (!user) return;
+
     const { id } = req.params as { id: string };
+    const [period] = await db
+      .select()
+      .from(academicPeriods)
+      .where(eq(academicPeriods.id, id));
+
+    if (!period) {
+      return sendError(reply, 404, 'NOT_FOUND', 'Periode akademik tidak ditemukan.');
+    }
+
+    // Archived semesters cannot be made default
+    if (period.status.toUpperCase() === 'ARCHIVED') {
+      return sendError(
+        reply,
+        400,
+        'ARCHIVED_PERIOD_CANNOT_BE_DEFAULT',
+        'Periode akademik yang telah diarsipkan tidak dapat dijadikan sebagai semester default.'
+      );
+    }
 
     const result = await db.transaction(async (tx) => {
+      // Find current default ID for audit log
+      const [currentDefault] = await tx
+        .select({ id: academicPeriods.id, code: academicPeriods.code })
+        .from(academicPeriods)
+        .where(eq(academicPeriods.isDefault, true))
+        .limit(1);
+
       await tx.update(academicPeriods).set({ isDefault: false, updatedAt: new Date() });
       const [updated] = await tx
         .update(academicPeriods)
-        .set({ isDefault: true, status: 'active', updatedAt: new Date() })
+        .set({ isDefault: true, updatedAt: new Date() })
         .where(eq(academicPeriods.id, id))
         .returning();
-      return updated;
+
+      return { updated, previousDefault: currentDefault || null };
     });
 
-    return sendSuccess(reply, result);
+    await recordAuditLog({
+      actorId: user.id,
+      action: 'ACADEMIC_PERIOD_DEFAULT_CHANGED',
+      entityType: 'ACADEMIC_PERIOD',
+      entityId: id,
+      metadata: {
+        previousDefaultId: result.previousDefault?.id || null,
+        previousDefaultCode: result.previousDefault?.code || null,
+        newDefaultId: result.updated.id,
+        newDefaultCode: result.updated.code,
+      },
+      ipAddress: req.ip,
+    });
+
+    return sendSuccess(reply, result.updated);
+  });
+
+  // Audit and Lifecycle History for Academic Period
+  fastify.get('/api/v1/admin/academic-periods/:id/history', async (req, reply) => {
+    const user = await authenticateRequest(req, reply, {
+      requiredPermissions: ['academic_period.view_history'],
+    });
+    if (!user) return;
+
+    const { id } = req.params as { id: string };
+    const [period] = await db
+      .select({ id: academicPeriods.id, name: academicPeriods.name, code: academicPeriods.code })
+      .from(academicPeriods)
+      .where(eq(academicPeriods.id, id));
+
+    if (!period) {
+      return sendError(reply, 404, 'NOT_FOUND', 'Periode akademik tidak ditemukan.');
+    }
+
+    const logs = await db
+      .select({
+        id: auditLogs.id,
+        action: auditLogs.action,
+        entityType: auditLogs.entityType,
+        entityId: auditLogs.entityId,
+        metadata: auditLogs.metadata,
+        ipAddress: auditLogs.ipAddress,
+        createdAt: auditLogs.createdAt,
+        actorId: auditLogs.actorId,
+        actorName: users.fullName,
+        actorEmail: users.email,
+      })
+      .from(auditLogs)
+      .leftJoin(users, eq(auditLogs.actorId, users.id))
+      .where(
+        and(
+          eq(auditLogs.entityType, 'ACADEMIC_PERIOD'),
+          eq(auditLogs.entityId, id)
+        )
+      )
+      .orderBy(desc(auditLogs.createdAt));
+
+    return sendSuccess(reply, {
+      period,
+      history: logs,
+    });
   });
 
   // ============================================================================
@@ -632,7 +1186,7 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
   // ============================================================================
 
   // List calendar events (Authenticated for students & lecturers)
-  fastify.get('/api/v1/academic-calendar', async (req, reply) => {
+  const listCalendarEventsHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     const user = await authenticateRequest(req, reply);
     if (!user) return;
 
@@ -666,6 +1220,63 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
       }));
 
     return sendSuccess(reply, visibleEvents);
+  };
+
+  fastify.get('/api/v1/academic-calendar', listCalendarEventsHandler);
+  fastify.get('/api/v1/admin/academic-calendar', listCalendarEventsHandler);
+
+  // Superadmin: Update Calendar Event
+  const updateCalendarEventSchema = z.object({
+    title: z.string().min(3).optional(),
+    description: z.string().optional(),
+    category: z.enum([
+      'LECTURE_START',
+      'LECTURE_END',
+      'KRS_REGISTRATION',
+      'UTS',
+      'UAS',
+      'HOLIDAY',
+      'GRADE_SUBMISSION',
+      'GRADE_CORRECTION',
+      'REMEDIAL',
+      'REGISTRATION_DEADLINE',
+      'OTHER',
+    ]).optional(),
+    startDate: z.string().optional(),
+    endDate: z.string().optional(),
+    isHoliday: z.boolean().optional(),
+    visibility: z.enum(['ALL', 'LECTURER_ONLY', 'STUDENT_ONLY', 'ADMIN_ONLY']).optional(),
+    color: z.string().optional(),
+  });
+
+  fastify.patch('/api/v1/admin/academic-calendar/:id', async (req, reply) => {
+    const user = await authenticateRequest(req, reply);
+    if (!user || !isSuperadmin(user)) return sendError(reply, 403, 'FORBIDDEN', 'Superadmin only');
+    const { id } = req.params as { id: string };
+
+    const parsed = updateCalendarEventSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return sendError(reply, 400, 'VALIDATION_ERROR', 'Data kalender akademik tidak valid.', parsed.error.issues);
+    }
+
+    const updates: any = { updatedAt: new Date() };
+    if (parsed.data.title !== undefined) updates.title = parsed.data.title;
+    if (parsed.data.description !== undefined) updates.description = parsed.data.description;
+    if (parsed.data.category !== undefined) updates.category = parsed.data.category;
+    if (parsed.data.startDate !== undefined) updates.startDate = new Date(parsed.data.startDate);
+    if (parsed.data.endDate !== undefined) updates.endDate = new Date(parsed.data.endDate);
+    if (parsed.data.isHoliday !== undefined) updates.isHoliday = parsed.data.isHoliday;
+    if (parsed.data.visibility !== undefined) updates.visibility = parsed.data.visibility;
+    if (parsed.data.color !== undefined) updates.color = parsed.data.color;
+
+    const [updated] = await db
+      .update(academicCalendarEvents)
+      .set(updates)
+      .where(eq(academicCalendarEvents.id, id))
+      .returning();
+
+    if (!updated) return sendError(reply, 404, 'NOT_FOUND', 'Acara kalender tidak ditemukan.');
+    return sendSuccess(reply, updated);
   });
 
   // Superadmin: Create Calendar Event
@@ -731,145 +1342,8 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
   });
 
   // ============================================================================
-  // MODULE C: COURSE OFFERINGS
+  // MODULE D: SCHEDULE CONFLICT DETECTION & CLASSROOM SCHEDULES
   // ============================================================================
-
-  // List course offerings
-  fastify.get('/api/v1/course-offerings', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user) return;
-
-    const query = req.query as { periodId?: string; studyProgram?: string };
-    const offerings = await db
-      .select({
-        offering: courseOfferings,
-        course: courses,
-        period: academicPeriods,
-        coordinator: users,
-      })
-      .from(courseOfferings)
-      .innerJoin(courses, eq(courseOfferings.courseId, courses.id))
-      .innerJoin(academicPeriods, eq(courseOfferings.academicPeriodId, academicPeriods.id))
-      .leftJoin(users, eq(courseOfferings.coordinatorId, users.id))
-      .orderBy(asc(courseOfferings.courseCode));
-
-    let filtered = offerings;
-    if (query.periodId) {
-      filtered = filtered.filter((o) => o.offering.academicPeriodId === query.periodId);
-    }
-    if (query.studyProgram && query.studyProgram !== 'all') {
-      filtered = filtered.filter((o) => o.offering.studyProgram.toLowerCase() === query.studyProgram?.toLowerCase());
-    }
-
-    // Attach active classroom count
-    const enriched = await Promise.all(
-      filtered.map(async (row) => {
-        const clsList = await db
-          .select({ id: classrooms.id })
-          .from(classrooms)
-          .where(eq(classrooms.courseOfferingId, row.offering.id));
-
-        return {
-          ...row.offering,
-          course: row.course,
-          period: row.period,
-          coordinatorName: row.coordinator?.fullName || null,
-          classroomCount: clsList.length,
-        };
-      })
-    );
-
-    return sendSuccess(reply, enriched);
-  });
-
-  // Create course offering
-  const createOfferingSchema = z.object({
-    courseId: z.string().uuid(),
-    academicPeriodId: z.string().uuid(),
-    studyProgram: z.string(),
-    courseCode: z.string(),
-    courseName: z.string(),
-    theoryCredits: z.number().int().default(2),
-    practicalCredits: z.number().int().default(1),
-    totalCredits: z.number().int().default(3),
-    coordinatorId: z.string().uuid().optional(),
-    maxClassrooms: z.number().int().default(5),
-  });
-
-  fastify.post('/api/v1/course-offerings', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user || !isLecturerOrAdmin(user)) {
-      return sendError(reply, 403, 'FORBIDDEN', 'Hanya Dosen atau Admin yang berwenang membuka penawaran mata kuliah.');
-    }
-
-    const parsed = createOfferingSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return sendError(reply, 400, 'VALIDATION_ERROR', 'Format tawaran mata kuliah tidak valid.', parsed.error.issues);
-    }
-
-    try {
-      const [created] = await db
-        .insert(courseOfferings)
-        .values({
-          ...parsed.data,
-          createdById: user.id,
-        })
-        .returning();
-
-      return sendSuccess(reply, created, null, 201);
-    } catch (err: any) {
-      return sendError(reply, 409, 'ALREADY_OFFERED', 'Mata kuliah sudah ditawarkan pada periode akademik ini.');
-    }
-  });
-
-  // ============================================================================
-  // MODULE D: CAMPUS FACILITIES & SCHEDULE CONFLICT DETECTION
-  // ============================================================================
-
-  // Buildings list
-  fastify.get('/api/v1/campus/buildings', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user) return;
-
-    const buildings = await db.select().from(campusBuildings).orderBy(asc(campusBuildings.name));
-    const roomsList = await db.select().from(campusRooms);
-
-    const enriched = buildings.map((b) => ({
-      ...b,
-      roomCount: roomsList.filter((r) => r.buildingId === b.id).length,
-    }));
-
-    return sendSuccess(reply, enriched);
-  });
-
-  // Rooms list
-  fastify.get('/api/v1/campus/rooms', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user) return;
-
-    const query = req.query as { buildingId?: string };
-    const rooms = await db
-      .select({
-        room: campusRooms,
-        building: campusBuildings,
-      })
-      .from(campusRooms)
-      .innerJoin(campusBuildings, eq(campusRooms.buildingId, campusBuildings.id))
-      .orderBy(asc(campusRooms.roomNumber));
-
-    let filtered = rooms;
-    if (query.buildingId) {
-      filtered = filtered.filter((r) => r.room.buildingId === query.buildingId);
-    }
-
-    const res = filtered.map((r) => ({
-      ...r.room,
-      buildingCode: r.building.code,
-      buildingName: r.building.name,
-    }));
-
-    return sendSuccess(reply, res);
-  });
 
   // Schedule conflict detection endpoint
   const conflictCheckSchema = z.object({
@@ -937,6 +1411,7 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
     instructorId: z.string().uuid().optional().nullable(),
     buildingId: z.string().uuid().optional().nullable(),
     roomId: z.string().uuid().optional().nullable(),
+    locationDescription: z.string().optional().nullable(),
     meetingType: z.enum(['OFFLINE', 'ONLINE', 'HYBRID']).default('OFFLINE'),
     onlineLink: z.string().optional().nullable(),
     force: z.boolean().default(false), // bypass non-blocking warning
@@ -981,8 +1456,9 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
         endTime: parsed.data.endTime,
         scheduleType: parsed.data.scheduleType,
         instructorId: parsed.data.instructorId || user.id,
-        buildingId: parsed.data.buildingId,
-        roomId: parsed.data.roomId,
+        buildingId: parsed.data.buildingId || null,
+        roomId: parsed.data.roomId || null,
+        locationDescription: parsed.data.locationDescription || null,
         meetingType: parsed.data.meetingType,
         onlineLink: parsed.data.onlineLink,
       })
@@ -1000,17 +1476,110 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
     return sendSuccess(reply, { deleted: true });
   });
 
+  // Update schedule
+  const updateScheduleSchema = z.object({
+    dayOfWeek: z.number().int().min(1).max(7).optional(),
+    startTime: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+    endTime: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+    scheduleType: z.enum(['THEORY', 'PRACTICAL', 'TUTORIAL', 'SEMINAR', 'EXAM']).optional(),
+    buildingId: z.string().uuid().optional().nullable(),
+    roomId: z.string().uuid().optional().nullable(),
+    meetingType: z.enum(['OFFLINE', 'ONLINE', 'HYBRID']).optional(),
+    onlineLink: z.string().optional().nullable(),
+    force: z.boolean().default(false),
+  });
+
+  fastify.patch('/api/v1/schedules/:id', async (req, reply) => {
+    const user = await authenticateRequest(req, reply);
+    if (!user || !isLecturerOrAdmin(user)) return sendError(reply, 403, 'FORBIDDEN', 'Dosen or Admin only');
+    const { id } = req.params as { id: string };
+
+    const [existing] = await db.select().from(classroomSchedules).where(eq(classroomSchedules.id, id));
+    if (!existing) return sendError(reply, 404, 'NOT_FOUND', 'Jadwal perkuliahan tidak ditemukan.');
+
+    const parsed = updateScheduleSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return sendError(reply, 400, 'VALIDATION_ERROR', 'Format jadwal tidak valid.', parsed.error.issues);
+    }
+
+    const day = parsed.data.dayOfWeek ?? existing.dayOfWeek;
+    const start = parsed.data.startTime ?? existing.startTime;
+    const end = parsed.data.endTime ?? existing.endTime;
+    const room = parsed.data.roomId !== undefined ? parsed.data.roomId : existing.roomId;
+
+    if (!parsed.data.force) {
+      const conflict = await detectScheduleConflicts({
+        classroomId: existing.classroomId,
+        scheduleId: id,
+        dayOfWeek: day,
+        startTime: start,
+        endTime: end,
+        instructorId: existing.instructorId,
+        roomId: room,
+      });
+      if (conflict.hasConflict) {
+        return sendError(reply, 409, 'SCHEDULE_CONFLICT', 'Bentrok jadwal perkuliahan terdeteksi.', conflict.conflicts);
+      }
+    }
+
+    const updates: any = { updatedAt: new Date() };
+    if (parsed.data.dayOfWeek !== undefined) updates.dayOfWeek = parsed.data.dayOfWeek;
+    if (parsed.data.startTime !== undefined) updates.startTime = parsed.data.startTime;
+    if (parsed.data.endTime !== undefined) updates.endTime = parsed.data.endTime;
+    if (parsed.data.scheduleType !== undefined) updates.scheduleType = parsed.data.scheduleType;
+    if (parsed.data.buildingId !== undefined) updates.buildingId = parsed.data.buildingId;
+    if (parsed.data.roomId !== undefined) updates.roomId = parsed.data.roomId;
+    if (parsed.data.meetingType !== undefined) updates.meetingType = parsed.data.meetingType;
+    if (parsed.data.onlineLink !== undefined) updates.onlineLink = parsed.data.onlineLink;
+
+    const [updated] = await db
+      .update(classroomSchedules)
+      .set(updates)
+      .where(eq(classroomSchedules.id, id))
+      .returning();
+
+    return sendSuccess(reply, updated);
+  });
+
+  // GET schedule conflicts via query params
+  fastify.get('/api/v1/schedules/conflicts', async (req, reply) => {
+    const user = await authenticateRequest(req, reply);
+    if (!user) return;
+
+    const query = req.query as any;
+    const dayOfWeek = Number(query.dayOfWeek) || 1;
+    const startTime = query.startTime || '08:00';
+    const endTime = query.endTime || '10:00';
+
+    const result = await detectScheduleConflicts({
+      classroomId: query.classroomId,
+      scheduleId: query.scheduleId,
+      dayOfWeek,
+      startTime,
+      endTime,
+      instructorId: query.instructorId || null,
+      roomId: query.roomId || null,
+    });
+
+    return sendSuccess(reply, result);
+  });
+
   // ============================================================================
   // MODULE E: ADVANCED CLASSROOM BUILDER (6-STEP WIZARD) & LIFECYCLE
   // ============================================================================
 
   const advancedClassroomBuilderSchema = z.object({
-    // Step 1 & 2: Academic & Basic Info
-    courseId: z.string().uuid(),
+    // Step 1 & 2: Classroom Identity & Academic Context
+    courseId: z.string().uuid().optional().nullable(),
     courseOfferingId: z.string().uuid().optional().nullable(),
     academicPeriodId: z.string().uuid().optional().nullable(),
     name: z.string().min(3),
     classroomCode: z.string().min(2).optional(),
+    subjectName: z.string().optional().nullable(),
+    subjectCode: z.string().optional().nullable(),
+    academicYear: z.string().optional().nullable(),
+    semesterName: z.string().optional().nullable(),
+    locationDescription: z.string().optional().nullable(),
     cohort: z.string().optional().default('2026'),
     section: z.string().min(1).default('A'),
     classroomType: z.enum(['REGULAR', 'PRACTICAL', 'HYBRID', 'SHORT_SEMESTER', 'REMEDIAL']).default('REGULAR'),
@@ -1018,13 +1587,24 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
     maxCapacity: z.number().int().min(1).max(250).default(35),
     category: z.string().default('REGULAR'),
     language: z.string().default('id'),
-    visibility: z.enum(['PUBLIC_ENROLLED', 'CAMPUS_WIDE', 'PRIVATE_RESTRICTED']).default('PUBLIC_ENROLLED'),
+    visibility: z
+      .enum(['PUBLIC', 'PRIVATE', 'PUBLIC_ENROLLED', 'CAMPUS_WIDE', 'PRIVATE_RESTRICTED'])
+      .default('PRIVATE'),
     learningObjectives: z.string().optional().default(''),
+    cpmk: z.string().optional().default(''),
+    coverImagePath: z.string().optional().nullable(),
+    coverThumbnailPath: z.string().optional().nullable(),
+    coverMimeType: z.string().optional().nullable(),
+    coverFileSize: z.number().int().optional().nullable(),
+    coverWidth: z.number().int().optional().nullable(),
+    coverHeight: z.number().int().optional().nullable(),
     description: z.string().optional().default(''),
     roomNumber: z.string().optional().default('Daring / Fleksibel'),
     scheduleText: z.string().optional().default('Sesuai Jadwal'),
 
-    // Step 3: Teaching Team
+    // Step 3: Teaching Team (supports both explicit primaryInstructorId/coInstructorIds and instructors array)
+    primaryInstructorId: z.string().uuid().optional().nullable(),
+    coInstructorIds: z.array(z.string().uuid()).optional().default([]),
     instructors: z.array(
       z.object({
         instructorId: z.string().uuid(),
@@ -1042,6 +1622,7 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
         scheduleType: z.enum(['THEORY', 'PRACTICAL', 'TUTORIAL', 'SEMINAR', 'EXAM']).default('THEORY'),
         buildingId: z.string().uuid().optional().nullable(),
         roomId: z.string().uuid().optional().nullable(),
+        locationDescription: z.string().optional().nullable(),
         meetingType: z.enum(['OFFLINE', 'ONLINE', 'HYBRID']).default('OFFLINE'),
         onlineLink: z.string().optional().nullable(),
       })
@@ -1065,9 +1646,199 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
     submitForApproval: z.boolean().default(false),
   });
 
+  // Upload & Optimize Classroom Cover Image
+  fastify.post('/api/v1/classrooms/cover-image', async (req, reply) => {
+    const user = await authenticateRequest(req, reply, { requireCsrf: false });
+    if (!user || !isLecturerOrAdmin(user)) {
+      return sendError(reply, 403, 'FORBIDDEN', 'Hanya Dosen atau Admin yang berwenang mengunggah cover ruang kelas.');
+    }
+
+    try {
+      let buffer: Buffer | null = null;
+
+      // 1. Check if multipart
+      if (req.isMultipart && req.isMultipart()) {
+        const file = await req.file();
+        if (file) {
+          buffer = await file.toBuffer();
+        }
+      }
+
+      // 2. Fallback JSON base64 body if not multipart
+      if (!buffer && req.body) {
+        const body = req.body as { imageBase64?: string };
+        if (body?.imageBase64) {
+          const raw = body.imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
+          buffer = Buffer.from(raw, 'base64');
+        }
+      }
+
+      if (!buffer || buffer.length === 0) {
+        return sendError(reply, 400, 'VALIDATION_ERROR', 'Berkas gambar wajib diunggah.');
+      }
+
+      const optimized = await processAndOptimizeCoverImage(buffer);
+      return sendSuccess(reply, optimized);
+    } catch (err: any) {
+      return sendError(
+        reply,
+        400,
+        'IMAGE_OPTIMIZATION_FAILED',
+        err.message || 'Gagal memproses dan mengoptimasi gambar sampul kelas.'
+      );
+    }
+  });
+
+  // Serve Optimized Cover Image from Private Storage
+  fastify.get('/api/v1/storage/covers/:filename', async (req, reply) => {
+    const { filename } = req.params as { filename: string };
+    if (!/^[a-zA-Z0-9_-]+\.webp$/.test(filename)) {
+      return sendError(reply, 400, 'INVALID_PATH', 'Nama berkas cover tidak valid.');
+    }
+
+    const fs = await import('fs');
+    try {
+      const fullPath = resolvePrivateObjectPath(`covers/${filename}`);
+      if (!fs.existsSync(fullPath)) {
+        return sendError(reply, 404, 'NOT_FOUND', 'Gambar sampul tidak ditemukan.');
+      }
+
+      const fileBuffer = fs.readFileSync(fullPath);
+      reply.header('Content-Type', 'image/webp');
+      reply.header('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+      return reply.send(fileBuffer);
+    } catch {
+      return sendError(reply, 404, 'NOT_FOUND', 'Gambar sampul tidak ditemukan.');
+    }
+  });
+
+  // Remove Classroom Cover Image
+  fastify.delete('/api/v1/classrooms/:id/cover-image', async (req, reply) => {
+    const user = await authenticateRequest(req, reply, { requireCsrf: false });
+    if (!user || !isLecturerOrAdmin(user)) {
+      return sendError(reply, 403, 'FORBIDDEN', 'Hanya Dosen atau Admin yang dapat menghapus cover kelas.');
+    }
+    const { id } = req.params as { id: string };
+
+    const [cls] = await db.select().from(classrooms).where(eq(classrooms.id, id));
+    if (!cls) return sendError(reply, 404, 'NOT_FOUND', 'Ruang kelas tidak ditemukan.');
+
+    if (cls.coverImagePath || cls.coverThumbnailPath) {
+      removeCoverImageFiles(cls.coverImagePath, cls.coverThumbnailPath);
+      await db
+        .update(classrooms)
+        .set({
+          coverImagePath: null,
+          coverThumbnailPath: null,
+          coverMimeType: null,
+          coverFileSize: null,
+          coverWidth: null,
+          coverHeight: null,
+          coverUpdatedAt: new Date(),
+        })
+        .where(eq(classrooms.id, id));
+    }
+
+    return sendSuccess(reply, { success: true, message: 'Gambar sampul kelas berhasil dihapus.' });
+  });
+
   // Advanced Classroom Creation Wizard API
+  // Eligible Lecturers Selector for Classroom Creation Wizard & Team Assignment
+  fastify.get('/api/v1/classrooms/eligible-instructors', async (req, reply) => {
+    const user = await authenticateRequest(req, reply, {
+      anyPermissions: ['classrooms:create', 'classrooms:manage_all', 'classrooms:teach'],
+    });
+    if (!user) return;
+
+    const query = req.query as {
+      search?: string;
+      studyProgram?: string;
+      status?: string;
+      page?: string;
+      limit?: string;
+    };
+
+    const search = (query.search || '').trim().toLowerCase();
+    const studyProgramFilter = (query.studyProgram || '').trim();
+    const statusFilter = (query.status || 'ACTIVE').trim().toUpperCase();
+    const page = Math.max(1, parseInt(query.page || '1', 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(query.limit || '50', 10) || 50));
+
+    const [dosenRole] = await db
+      .select()
+      .from(roles)
+      .where(eq(roles.code, 'DOSEN'))
+      .limit(1);
+
+    if (!dosenRole) {
+      return sendSuccess(reply, [], { page: 1, limit, total: 0, totalPages: 1, studyPrograms: [] });
+    }
+
+    const lecturerRows = await db
+      .select({
+        id: users.id,
+        fullName: users.fullName,
+        email: users.email,
+        identityNumber: users.identityNumber,
+        isActive: users.isActive,
+        accountStatus: users.accountStatus,
+        studyProgram: userProfiles.studyProgram,
+        organizationalUnit: userProfiles.organizationalUnit,
+        nidn: userProfiles.nidn,
+        nip: userProfiles.nip,
+        academicTitle: userProfiles.academicTitle,
+        avatarUrl: userProfiles.avatarUrl,
+      })
+      .from(userRoles)
+      .innerJoin(users, eq(userRoles.userId, users.id))
+      .leftJoin(userProfiles, eq(users.id, userProfiles.userId))
+      .where(eq(userRoles.roleId, dosenRole.id))
+      .orderBy(asc(users.fullName));
+
+    const studyProgramsSet = new Set<string>();
+    for (const r of lecturerRows) {
+      if (r.studyProgram) studyProgramsSet.add(r.studyProgram);
+    }
+
+    const filtered = lecturerRows.filter((r) => {
+      const effectiveActive = r.isActive && r.accountStatus === 'ACTIVE';
+      if (statusFilter === 'ACTIVE' && !effectiveActive) return false;
+      if (statusFilter === 'INACTIVE' && effectiveActive) return false;
+      if (studyProgramFilter && (r.studyProgram || '') !== studyProgramFilter) return false;
+      if (search) {
+        const hay = [
+          r.fullName,
+          r.email,
+          r.identityNumber,
+          r.nidn,
+          r.nip,
+          r.studyProgram,
+          r.academicTitle,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        if (!hay.includes(search)) return false;
+      }
+      return true;
+    });
+
+    const total = filtered.length;
+    const paginated = filtered.slice((page - 1) * limit, page * limit);
+
+    return sendSuccess(reply, paginated, {
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+      studyPrograms: Array.from(studyProgramsSet).sort(),
+    });
+  });
+
   fastify.post('/api/v1/classrooms/builder', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
+    const user = await authenticateRequest(req, reply, {
+      anyPermissions: ['classrooms:create', 'classrooms:manage_all'],
+    });
     if (!user || !isLecturerOrAdmin(user)) {
       return sendError(reply, 403, 'FORBIDDEN', 'Hanya Dosen atau Admin yang berwenang membuat ruang kelas baru.');
     }
@@ -1078,6 +1849,156 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
     }
 
     const data = parsed.data;
+    const isAdminActor = isSuperadmin(user);
+
+    // Resolve Primary Instructor & Co-Instructors based on role
+    const explicitPrimaryFromArray = data.instructors.find((i) => i.role === 'PRIMARY_INSTRUCTOR')?.instructorId;
+    const requestedPrimaryId = data.primaryInstructorId || explicitPrimaryFromArray || null;
+
+    let primaryInstructorId: string;
+    if (isAdminActor) {
+      if (!requestedPrimaryId) {
+        return sendError(
+          reply,
+          400,
+          'PRIMARY_INSTRUCTOR_REQUIRED',
+          'Dosen pengampu utama (Primary Instructor) wajib dipilih saat membuat kelas atas nama dosen.'
+        );
+      }
+      primaryInstructorId = requestedPrimaryId;
+    } else {
+      // Lecturer Self-Service: reject API manipulation attempting to assign another user as primary instructor
+      if (requestedPrimaryId && requestedPrimaryId !== user.id) {
+        return sendError(
+          reply,
+          403,
+          'FORBIDDEN_PRIMARY_ASSIGNMENT',
+          'Dosen tidak berwenang menetapkan pengguna lain sebagai dosen pengampu utama saat membuat kelas.'
+        );
+      }
+      primaryInstructorId = user.id;
+    }
+
+    // Collect co-instructors from coInstructorIds + instructors array (excluding PRIMARY_INSTRUCTOR role)
+    const coInstructorMap = new Map<
+      string,
+      { instructorId: string; role: 'CO_INSTRUCTOR' | 'TEACHING_ASSISTANT' | 'GUEST_INSTRUCTOR'; permissionScopes: string[] }
+    >();
+
+    for (const coId of data.coInstructorIds || []) {
+      if (coId === primaryInstructorId) {
+        return sendError(
+          reply,
+          400,
+          'DUPLICATE_PRIMARY_INSTRUCTOR',
+          'Dosen pengampu utama tidak boleh dipilih kembali sebagai co-instructor.'
+        );
+      }
+      coInstructorMap.set(coId, {
+        instructorId: coId,
+        role: 'CO_INSTRUCTOR',
+        permissionScopes: ['grading', 'materials', 'announcements'],
+      });
+    }
+
+    for (const inst of data.instructors) {
+      if (inst.role === 'PRIMARY_INSTRUCTOR') {
+        if (inst.instructorId !== primaryInstructorId) {
+          return sendError(
+            reply,
+            400,
+            'MULTIPLE_PRIMARY_INSTRUCTORS',
+            'Hanya satu dosen pengampu utama (Primary Instructor) yang diperbolehkan.'
+          );
+        }
+        continue;
+      }
+      if (inst.instructorId === primaryInstructorId) {
+        return sendError(
+          reply,
+          400,
+          'DUPLICATE_PRIMARY_INSTRUCTOR',
+          'Dosen pengampu utama tidak boleh dipilih kembali sebagai co-instructor.'
+        );
+      }
+      if (coInstructorMap.has(inst.instructorId)) {
+        return sendError(
+          reply,
+          400,
+          'DUPLICATE_CO_INSTRUCTOR',
+          'Terdapat duplikasi dosen pendamping dalam tim pengajar.'
+        );
+      }
+      coInstructorMap.set(inst.instructorId, {
+        instructorId: inst.instructorId,
+        role: inst.role,
+        permissionScopes: inst.permissionScopes,
+      });
+    }
+
+    // Validate Primary Instructor & all Co-Instructors are active users with DOSEN role
+    const [dosenRole] = await db
+      .select()
+      .from(roles)
+      .where(eq(roles.code, 'DOSEN'))
+      .limit(1);
+
+    const allTeamIds = [primaryInstructorId, ...Array.from(coInstructorMap.keys())];
+    const teamUsers = await db
+      .select({
+        id: users.id,
+        fullName: users.fullName,
+        isActive: users.isActive,
+        accountStatus: users.accountStatus,
+      })
+      .from(users)
+      .where(inArray(users.id, allTeamIds));
+
+    const teamRoleRows = dosenRole
+      ? await db
+          .select({ userId: userRoles.userId })
+          .from(userRoles)
+          .where(
+            and(
+              eq(userRoles.roleId, dosenRole.id),
+              inArray(userRoles.userId, allTeamIds)
+            )
+          )
+      : [];
+    const dosenUserIdSet = new Set(teamRoleRows.map((r) => r.userId));
+    const teamUserMap = new Map(teamUsers.map((u) => [u.id, u]));
+
+    const primaryUser = teamUserMap.get(primaryInstructorId);
+    if (
+      !primaryUser ||
+      !primaryUser.isActive ||
+      primaryUser.accountStatus !== 'ACTIVE' ||
+      !dosenUserIdSet.has(primaryInstructorId)
+    ) {
+      return sendError(
+        reply,
+        400,
+        'INVALID_PRIMARY_INSTRUCTOR',
+        'Dosen pengampu utama tidak ditemukan, tidak aktif, atau tidak memiliki role DOSEN.'
+      );
+    }
+
+    for (const coId of coInstructorMap.keys()) {
+      const coUser = teamUserMap.get(coId);
+      if (
+        !coUser ||
+        !coUser.isActive ||
+        coUser.accountStatus !== 'ACTIVE' ||
+        !dosenUserIdSet.has(coId)
+      ) {
+        return sendError(
+          reply,
+          400,
+          'INVALID_CO_INSTRUCTOR',
+          'Salah satu dosen pendamping tidak ditemukan, tidak aktif, atau tidak memiliki role DOSEN.'
+        );
+      }
+    }
 
     // Resolve academic period (default period if not provided)
     let resolvedPeriodId = data.academicPeriodId;
@@ -1092,12 +2013,15 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
 
     // Resolve semesterId for backward-compatibility
     const [latestSemester] = await db.select().from(semesters).limit(1);
-    const semesterId = latestSemester?.id || '00000000-0000-0000-0000-000000000000';
+    const semesterId = latestSemester?.id || null;
 
     // Verify academic period validity
     if (resolvedPeriodId) {
       const [period] = await db.select().from(academicPeriods).where(eq(academicPeriods.id, resolvedPeriodId));
-      if (period && ['completed', 'archived'].includes(period.status)) {
+      if (!period) {
+        return sendError(reply, 404, 'PERIOD_NOT_FOUND', 'Periode akademik tidak ditemukan.');
+      }
+      if (['COMPLETED', 'ARCHIVED'].includes(period.status.toUpperCase())) {
         return sendError(
           reply,
           400,
@@ -1107,14 +2031,14 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
       }
     }
 
-    // Check schedules for conflicts
+    // Check schedules for conflicts against the actual primaryInstructorId
     for (const sched of data.schedules) {
       const conflict = await detectScheduleConflicts({
         dayOfWeek: sched.dayOfWeek,
         startTime: sched.startTime,
         endTime: sched.endTime,
-        instructorId: user.id,
-        roomId: sched.roomId,
+        instructorId: primaryInstructorId,
+        roomId: sched.roomId || null,
       });
       if (conflict.hasConflict) {
         return sendError(
@@ -1139,19 +2063,26 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
           initialApproval = 'PENDING';
         }
 
-        // 1. Create Classroom
+        const effectiveLocation = data.locationDescription || data.roomNumber || 'Daring / Fleksibel';
+
+        // 1. Create Classroom (createdById = administrative/self creator)
         const [createdClass] = await tx
           .insert(classrooms)
           .values({
-            courseId: data.courseId,
-            courseOfferingId: data.courseOfferingId,
+            courseId: data.courseId || null,
+            courseOfferingId: data.courseOfferingId || null,
             academicPeriodId: resolvedPeriodId,
             semesterId,
             name: data.name,
             classroomCode: data.classroomCode || randomJoinCode,
+            subjectName: data.subjectName || null,
+            subjectCode: data.subjectCode || null,
+            academicYear: data.academicYear || null,
+            semesterName: data.semesterName || null,
+            locationDescription: effectiveLocation,
             cohort: data.cohort,
             section: data.section,
-            roomNumber: data.roomNumber,
+            roomNumber: effectiveLocation,
             scheduleText: data.scheduleText,
             classroomType: data.classroomType,
             minCapacity: data.minCapacity,
@@ -1160,7 +2091,15 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
             category: data.category,
             language: data.language,
             visibility: data.visibility,
-            learningObjectives: data.learningObjectives,
+            learningObjectives: data.learningObjectives || data.cpmk || null,
+            cpmk: data.cpmk || data.learningObjectives || null,
+            coverImagePath: data.coverImagePath || null,
+            coverThumbnailPath: data.coverThumbnailPath || null,
+            coverMimeType: data.coverMimeType || (data.coverImagePath ? 'image/webp' : null),
+            coverFileSize: data.coverFileSize || null,
+            coverWidth: data.coverWidth || null,
+            coverHeight: data.coverHeight || null,
+            coverUpdatedAt: data.coverImagePath ? new Date() : null,
             description: data.description,
             lifecycleStatus: initialLifecycle,
             approvalStatus: initialApproval,
@@ -1169,36 +2108,27 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
           })
           .returning();
 
-        // 2. Create Teaching Team
-        const instructorsToInsert: any[] = [];
-        // Add creator as primary if not included
-        const hasPrimary = data.instructors.some((i) => i.role === 'PRIMARY_INSTRUCTOR');
-        if (!hasPrimary || !data.instructors.some((i) => i.instructorId === user.id)) {
-          instructorsToInsert.push({
+        // 2. Create Teaching Team (Never auto-add Superadmin as instructor!)
+        const instructorsToInsert = [
+          {
             classroomId: createdClass.id,
-            instructorId: user.id,
+            instructorId: primaryInstructorId,
             role: 'PRIMARY_INSTRUCTOR',
             isPrimary: true,
             permissionScopes: ['all'],
-          });
-        }
-
-        for (const inst of data.instructors) {
-          if (inst.instructorId === user.id && instructorsToInsert.length > 0) continue;
-          instructorsToInsert.push({
+          },
+          ...Array.from(coInstructorMap.values()).map((co) => ({
             classroomId: createdClass.id,
-            instructorId: inst.instructorId,
-            role: inst.role,
-            isPrimary: inst.role === 'PRIMARY_INSTRUCTOR',
-            permissionScopes: inst.permissionScopes,
-          });
-        }
+            instructorId: co.instructorId,
+            role: co.role,
+            isPrimary: false,
+            permissionScopes: co.permissionScopes,
+          })),
+        ];
 
-        if (instructorsToInsert.length > 0) {
-          await tx.insert(classroomInstructors).values(instructorsToInsert);
-        }
+        await tx.insert(classroomInstructors).values(instructorsToInsert);
 
-        // 3. Create Schedules
+        // 3. Create Schedules (bound to primaryInstructorId)
         if (data.schedules.length > 0) {
           const scheduleValues = data.schedules.map((s) => ({
             classroomId: createdClass.id,
@@ -1206,9 +2136,10 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
             startTime: s.startTime,
             endTime: s.endTime,
             scheduleType: s.scheduleType,
-            instructorId: user.id,
-            buildingId: s.buildingId,
-            roomId: s.roomId,
+            instructorId: primaryInstructorId,
+            buildingId: s.buildingId || null,
+            roomId: s.roomId || null,
+            locationDescription: s.locationDescription || null,
             meetingType: s.meetingType,
             onlineLink: s.onlineLink,
           }));
@@ -1265,17 +2196,78 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
         return {
           ...createdClass,
           joinCode: joinCode.code,
+          primaryInstructorId,
+          academicOwnerId: primaryInstructorId,
+          coInstructorIds: Array.from(coInstructorMap.keys()),
+          delegated: isAdminActor && primaryInstructorId !== user.id,
         };
+      });
+
+      const coIds = Array.from(coInstructorMap.keys());
+      const actorRole = isAdminActor ? 'SUPERADMIN' : 'DOSEN';
+      const isDelegated = isAdminActor && primaryInstructorId !== user.id;
+
+      await recordAuditLog({
+        actorId: user.id,
+        action: isDelegated ? 'CLASSROOM_CREATED_ON_BEHALF' : 'CLASSROOM_CREATED',
+        entityType: 'CLASSROOM',
+        entityId: result.id,
+        metadata: {
+          actorRole,
+          classroomId: result.id,
+          name: result.name,
+          code: result.classroomCode,
+          delegated: isDelegated,
+          primaryInstructorId,
+          academicOwnerId: primaryInstructorId,
+          coInstructorIds: coIds,
+        },
+        ipAddress: req.ip,
       });
 
       await recordAuditLog({
         actorId: user.id,
-        action: 'CLASSROOM_CREATED_ADVANCED',
-        entityType: 'CLASSROOM',
+        action: 'PRIMARY_INSTRUCTOR_ASSIGNED',
+        entityType: 'CLASSROOM_INSTRUCTOR',
         entityId: result.id,
-        metadata: { name: result.name, code: result.classroomCode },
+        metadata: {
+          actorRole,
+          classroomId: result.id,
+          primaryInstructorId,
+          primaryInstructorName: primaryUser.fullName,
+        },
         ipAddress: req.ip,
       });
+
+      if (coIds.length > 0) {
+        await recordAuditLog({
+          actorId: user.id,
+          action: 'CO_INSTRUCTOR_ASSIGNED',
+          entityType: 'CLASSROOM_INSTRUCTOR',
+          entityId: result.id,
+          metadata: {
+            actorRole,
+            classroomId: result.id,
+            coInstructorIds: coIds,
+          },
+          ipAddress: req.ip,
+        });
+      }
+
+      if (result.lifecycleStatus === 'active') {
+        await recordAuditLog({
+          actorId: user.id,
+          action: 'CLASSROOM_PUBLISHED',
+          entityType: 'CLASSROOM',
+          entityId: result.id,
+          metadata: {
+            actorRole,
+            classroomId: result.id,
+            primaryInstructorId,
+          },
+          ipAddress: req.ip,
+        });
+      }
 
       return sendSuccess(reply, result, null, 201);
     } catch (err: any) {
@@ -1380,18 +2372,51 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
 
   fastify.post('/api/v1/classrooms/:id/archive', async (req, reply) => {
     const user = await authenticateRequest(req, reply);
-    if (!user || !isLecturerOrAdmin(user)) return sendError(reply, 403, 'FORBIDDEN', 'Dosen or Admin only');
+    if (!user) return;
     const { id } = req.params as { id: string };
+
+    const roleInfo = await resolveClassroomRole(user, id);
+    const canArchive =
+      roleInfo.role === 'SUPERADMIN' ||
+      roleInfo.isCreator ||
+      roleInfo.canManageAll;
+    if (!canArchive) {
+      return sendError(
+        reply,
+        403,
+        'FORBIDDEN',
+        'Hanya pembuat kelas atau administrator yang dapat mengarsipkan ruang kelas.'
+      );
+    }
+
+    const [existing] = await db.select().from(classrooms).where(eq(classrooms.id, id));
+    if (!existing) {
+      return sendError(reply, 404, 'CLASSROOM_NOT_FOUND', 'Ruang kelas tidak ditemukan.');
+    }
 
     const [updated] = await db
       .update(classrooms)
       .set({
         lifecycleStatus: 'archived',
+        status: 'ARCHIVED',
         archivedAt: new Date(),
         updatedAt: new Date(),
       })
       .where(eq(classrooms.id, id))
       .returning();
+
+    await recordClassroomAudit({
+      classroomId: id,
+      actorId: user.id,
+      actorRole: roleInfo.role,
+      resourceType: 'CLASSROOM',
+      resourceId: id,
+      resourceTitle: existing.name,
+      action: 'ARCHIVED',
+      changeSummary: `Mengarsipkan ruang kelas "${existing.name}"`,
+      beforeValue: { lifecycleStatus: existing.lifecycleStatus, status: existing.status },
+      afterValue: { lifecycleStatus: 'archived', status: 'ARCHIVED' },
+    });
 
     return sendSuccess(reply, updated);
   });
@@ -1399,279 +2424,6 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
   // ============================================================================
   // MODULE F: ENROLLMENT & PARTICIPANT MANAGEMENT
   // ============================================================================
-
-  // Student Catalog: View published/active classrooms available for enrollment
-  fastify.get('/api/v1/classrooms/catalog', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user) return;
-
-    const query = req.query as { periodId?: string; search?: string; studyProgram?: string };
-    
-    // Fetch default period if none requested
-    let targetPeriodId = query.periodId;
-    if (!targetPeriodId) {
-      const [def] = await db.select().from(academicPeriods).where(eq(academicPeriods.isDefault, true));
-      targetPeriodId = def?.id;
-    }
-
-    const allClasses = await db
-      .select({
-        cls: classrooms,
-        course: courses,
-        period: academicPeriods,
-        policy: classroomEnrollmentPolicies,
-      })
-      .from(classrooms)
-      .innerJoin(courses, eq(classrooms.courseId, courses.id))
-      .leftJoin(academicPeriods, eq(classrooms.academicPeriodId, academicPeriods.id))
-      .leftJoin(classroomEnrollmentPolicies, eq(classrooms.id, classroomEnrollmentPolicies.classroomId))
-      .where(
-        and(
-          eq(classrooms.lifecycleStatus, 'active'),
-          targetPeriodId ? eq(classrooms.academicPeriodId, targetPeriodId) : undefined
-        )
-      )
-      .orderBy(asc(courses.code), asc(classrooms.section));
-
-    // Get all enrollments & waitlists for current user
-    const userEnrollments = await db
-      .select()
-      .from(classroomEnrollments)
-      .where(eq(classroomEnrollments.studentId, user.id));
-
-    const userWaitlists = await db
-      .select()
-      .from(classroomWaitlists)
-      .where(eq(classroomWaitlists.studentId, user.id));
-
-    // Instructors
-    const allInstructors = await db
-      .select({
-        classroomId: classroomInstructors.classroomId,
-        instructorName: users.fullName,
-        isPrimary: classroomInstructors.isPrimary,
-      })
-      .from(classroomInstructors)
-      .innerJoin(users, eq(classroomInstructors.instructorId, users.id));
-
-    const enrollCounts = await db
-      .select({
-        classroomId: classroomEnrollments.classroomId,
-        count: sql<number>`count(*)::int`,
-      })
-      .from(classroomEnrollments)
-      .where(eq(classroomEnrollments.status, 'active'))
-      .groupBy(classroomEnrollments.classroomId);
-
-    const countMap = new Map(enrollCounts.map((c) => [c.classroomId, c.count]));
-
-    let items = allClasses.map((row) => {
-      const myEnrollment = userEnrollments.find((e) => e.classroomId === row.cls.id);
-      const myWaitlist = userWaitlists.find((w) => w.classroomId === row.cls.id);
-      const activeCount = countMap.get(row.cls.id) || 0;
-      const maxSeats = row.policy?.maxParticipants || row.cls.maxCapacity || 35;
-      const instructors = allInstructors
-        .filter((i) => i.classroomId === row.cls.id)
-        .map((i) => i.instructorName);
-
-      return {
-        id: row.cls.id,
-        name: row.cls.name,
-        section: row.cls.section,
-        classroomCode: row.cls.classroomCode,
-        courseCode: row.course.code,
-        courseTitle: row.course.title,
-        credits: row.course.credits,
-        studyProgram: row.course.studyProgram,
-        periodName: row.period?.name || 'Semester Aktif',
-        periodStatus: row.period?.status || 'active',
-        enrollmentMode: row.policy?.enrollmentMode || 'AUTO',
-        activeParticipants: activeCount,
-        maxCapacity: maxSeats,
-        isFull: activeCount >= maxSeats,
-        waitingListEnabled: row.policy?.waitingListEnabled ?? true,
-        myStatus: myEnrollment ? myEnrollment.status : myWaitlist ? 'waitlisted' : null,
-        instructors,
-      };
-    });
-
-    if (query.search) {
-      const q = query.search.toLowerCase();
-      items = items.filter(
-        (i) => i.name.toLowerCase().includes(q) || i.courseCode.toLowerCase().includes(q) || i.courseTitle.toLowerCase().includes(q)
-      );
-    }
-    if (query.studyProgram && query.studyProgram !== 'all') {
-      items = items.filter((i) => i.studyProgram.toLowerCase() === query.studyProgram?.toLowerCase());
-    }
-
-    return sendSuccess(reply, items);
-  });
-
-  // Student self-enrollment from Catalog
-  fastify.post('/api/v1/classrooms/:id/enroll', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user) return;
-    const { id } = req.params as { id: string };
-
-    // 1. Check classroom existence & status
-    const [cls] = await db
-      .select({
-        cls: classrooms,
-        period: academicPeriods,
-        policy: classroomEnrollmentPolicies,
-      })
-      .from(classrooms)
-      .leftJoin(academicPeriods, eq(classrooms.academicPeriodId, academicPeriods.id))
-      .leftJoin(classroomEnrollmentPolicies, eq(classrooms.id, classroomEnrollmentPolicies.classroomId))
-      .where(eq(classrooms.id, id));
-
-    if (!cls) return sendError(reply, 404, 'NOT_FOUND', 'Ruang kelas tidak ditemukan.');
-
-    if (cls.cls.lifecycleStatus !== 'active') {
-      return sendError(
-        reply,
-        400,
-        'CLASS_NOT_ACTIVE',
-        `Pendaftaran tidak dibuka: Ruang kelas berstatus ${cls.cls.lifecycleStatus.toUpperCase()}.`
-      );
-    }
-
-    // 2. Check academic period registration window
-    if (cls.period) {
-      if (['registration_closed', 'completed', 'archived'].includes(cls.period.status)) {
-        return sendError(
-          reply,
-          400,
-          'REGISTRATION_CLOSED',
-          `Masa pendaftaran perkuliahan untuk ${cls.period.name} telah ditutup.`
-        );
-      }
-    }
-
-    // 3. Check existing enrollment
-    const [existingEnrollment] = await db
-      .select()
-      .from(classroomEnrollments)
-      .where(
-        and(
-          eq(classroomEnrollments.classroomId, id),
-          eq(classroomEnrollments.studentId, user.id)
-        )
-      );
-
-    if (existingEnrollment) {
-      if (existingEnrollment.status === 'active') {
-        return sendError(reply, 400, 'ALREADY_ENROLLED', 'Anda sudah terdaftar aktif di kelas ini.');
-      }
-      if (existingEnrollment.status === 'pending') {
-        return sendError(reply, 400, 'ALREADY_PENDING', 'Pendaftaran Anda sedang menunggu persetujuan Dosen.');
-      }
-    }
-
-    // 4. Check capacity & perform enrollment or waitlist in transaction
-    const policy = cls.policy;
-    const maxCapacity = policy?.maxParticipants || cls.cls.maxCapacity || 35;
-    const enrollMode = policy?.enrollmentMode || 'AUTO';
-
-    try {
-      const outcome = await db.transaction(async (tx) => {
-        // Count active enrollments
-        const activeRows = await tx
-          .select({ id: classroomEnrollments.id })
-          .from(classroomEnrollments)
-          .where(
-            and(
-              eq(classroomEnrollments.classroomId, id),
-              eq(classroomEnrollments.status, 'active')
-            )
-          );
-
-        const currentCount = activeRows.length;
-        const isFull = currentCount >= maxCapacity;
-
-        if (isFull) {
-          // Check waitlist
-          if (policy?.waitingListEnabled ?? true) {
-            const waitlistRows = await tx
-              .select({ id: classroomWaitlists.id })
-              .from(classroomWaitlists)
-              .where(
-                and(
-                  eq(classroomWaitlists.classroomId, id),
-                  eq(classroomWaitlists.status, 'WAITING')
-                )
-              );
-
-            const maxWaiting = policy?.maxWaitingList || 15;
-            if (waitlistRows.length >= maxWaiting) {
-              throw new Error('WAITLIST_FULL');
-            }
-
-            const queueNum = waitlistRows.length + 1;
-            const [waitlistEntry] = await tx
-              .insert(classroomWaitlists)
-              .values({
-                classroomId: id,
-                studentId: user.id,
-                queueNumber: queueNum,
-                status: 'WAITING',
-              })
-              .onConflictDoUpdate({
-                target: [classroomWaitlists.classroomId, classroomWaitlists.studentId],
-                set: { status: 'WAITING', queueNumber: queueNum, updatedAt: new Date() },
-              })
-              .returning();
-
-            return { enrolled: false, waitlisted: true, queueNumber: queueNum, message: 'Kapasitas penuh. Anda masuk antrean waiting list.' };
-          } else {
-            throw new Error('CLASSROOM_FULL');
-          }
-        }
-
-        // Seats available
-        const statusToSet = enrollMode === 'APPROVAL_REQUIRED' ? 'pending' : 'active';
-        const [enrollment] = await tx
-          .insert(classroomEnrollments)
-          .values({
-            classroomId: id,
-            studentId: user.id,
-            status: statusToSet,
-            enrollmentSource: 'CATALOG',
-            enrolledAt: new Date(),
-          })
-          .onConflictDoUpdate({
-            target: [classroomEnrollments.classroomId, classroomEnrollments.studentId],
-            set: {
-              status: statusToSet,
-              enrollmentSource: 'CATALOG',
-              enrolledAt: new Date(),
-              withdrawnAt: null,
-            },
-          })
-          .returning();
-
-        return {
-          enrolled: true,
-          waitlisted: false,
-          status: statusToSet,
-          message: statusToSet === 'active' ? 'Pendaftaran berhasil! Anda telah terdaftar aktif.' : 'Pendaftaran berhasil dikirim! Menunggu persetujuan Dosen Pengampu.',
-          enrollment,
-        };
-      });
-
-      return sendSuccess(reply, outcome);
-    } catch (err: any) {
-      if (err.message === 'CLASSROOM_FULL') {
-        return sendError(reply, 409, 'CLASSROOM_FULL', 'Kapasitas kelas telah penuh dan kuota waitlist tidak diaktifkan.');
-      }
-      if (err.message === 'WAITLIST_FULL') {
-        return sendError(reply, 409, 'WAITLIST_FULL', 'Kapasitas kelas dan antrean waiting list telah penuh.');
-      }
-      console.error('Enrollment transaction failed:', err);
-      return sendError(reply, 500, 'ENROLLMENT_ERROR', 'Gagal memproses pendaftaran kelas.');
-    }
-  });
 
   // Join via Join Code with concurrency lock & max usage
   fastify.post('/api/v1/classrooms/:id/join', async (req, reply) => {
@@ -1713,6 +2465,65 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
           throw new Error('JOIN_CODE_MAX_REACHED');
         }
 
+        // Check classroom capacity & waiting list policy
+        const [cls] = await tx
+          .select({
+            cls: classrooms,
+            policy: classroomEnrollmentPolicies,
+          })
+          .from(classrooms)
+          .leftJoin(classroomEnrollmentPolicies, eq(classrooms.id, classroomEnrollmentPolicies.classroomId))
+          .where(eq(classrooms.id, id));
+
+        const maxCapacity = cls?.policy?.maxParticipants || cls?.cls?.maxCapacity || 35;
+        const activeRows = await tx
+          .select({ id: classroomEnrollments.id })
+          .from(classroomEnrollments)
+          .where(
+            and(
+              eq(classroomEnrollments.classroomId, id),
+              eq(classroomEnrollments.status, 'active')
+            )
+          );
+
+        if (activeRows.length >= maxCapacity) {
+          if (cls?.policy?.waitingListEnabled ?? true) {
+            const waitlistRows = await tx
+              .select({ id: classroomWaitlists.id })
+              .from(classroomWaitlists)
+              .where(
+                and(
+                  eq(classroomWaitlists.classroomId, id),
+                  eq(classroomWaitlists.status, 'WAITING')
+                )
+              );
+
+            const queueNum = waitlistRows.length + 1;
+            await tx
+              .insert(classroomWaitlists)
+              .values({
+                classroomId: id,
+                studentId: user.id,
+                queueNumber: queueNum,
+                status: 'WAITING',
+              })
+              .onConflictDoUpdate({
+                target: [classroomWaitlists.classroomId, classroomWaitlists.studentId],
+                set: { status: 'WAITING', queueNumber: queueNum, updatedAt: new Date() },
+              });
+
+            return {
+              enrolled: false,
+              waitlisted: true,
+              queueNumber: queueNum,
+              status: 'waitlisted',
+              message: 'Kapasitas penuh. Anda masuk antrean waiting list.',
+            };
+          } else {
+            throw new Error('CLASSROOM_FULL');
+          }
+        }
+
         // Increment usage
         await tx
           .update(classroomJoinCodes)
@@ -1742,13 +2553,24 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
           })
           .returning();
 
-        return enrollment;
+        return {
+          enrolled: true,
+          waitlisted: false,
+          queueNumber: undefined,
+          status: 'active',
+          message: 'Berhasil bergabung ke dalam kelas digital Politeknik Kampar.',
+          enrollment,
+        };
       });
 
       return sendSuccess(reply, {
         success: true,
-        message: 'Berhasil bergabung ke dalam kelas digital Politeknik Kampar.',
-        enrollment: outcome,
+        enrolled: outcome.enrolled,
+        waitlisted: outcome.waitlisted,
+        queueNumber: outcome.queueNumber,
+        status: outcome.status,
+        message: outcome.message,
+        enrollment: outcome.enrollment,
       });
     } catch (err: any) {
       if (err.message === 'INVALID_JOIN_CODE') {
@@ -1999,177 +2821,74 @@ export async function registerAcademicClassroomRoutes(fastify: FastifyInstance):
     return sendSuccess(reply, { enrolledCount, message: `Berhasil mendaftarkan ${enrolledCount} mahasiswa ke kelas ini.` });
   });
 
-  // ============================================================================
-  // MODULE G: ROLE-SPECIFIC DASHBOARDS
-  // ============================================================================
-
-  // Superadmin Dashboard
-  fastify.get('/api/v1/dashboards/superadmin', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user || !isSuperadmin(user)) return sendError(reply, 403, 'FORBIDDEN', 'Superadmin only');
-
-    const allClasses = await db.select().from(classrooms);
-    const allUsers = await db.select().from(users);
-    const allRoles = await db.select().from(userRoles);
-    const roleMap = await db.select().from(roles);
-
-    const dosenRoleId = roleMap.find((r) => r.code === 'DOSEN')?.id;
-    const mhsRoleId = roleMap.find((r) => r.code === 'MAHASISWA')?.id;
-
-    const totalLecturers = allRoles.filter((ur) => ur.roleId === dosenRoleId).length;
-    const totalStudents = allRoles.filter((ur) => ur.roleId === mhsRoleId).length;
-
-    const activeClassrooms = allClasses.filter((c) => c.lifecycleStatus === 'active').length;
-    const draftClassrooms = allClasses.filter((c) => c.lifecycleStatus === 'draft').length;
-    const pendingApprovalClassrooms = allClasses.filter((c) => c.lifecycleStatus === 'pending_approval').length;
-    const completedClassrooms = allClasses.filter((c) => c.lifecycleStatus === 'completed').length;
-
-    // Classrooms with 0 students
-    const enrollments = await db.select().from(classroomEnrollments);
-    const enrolledClassroomIds = new Set(enrollments.filter((e) => e.status === 'active').map((e) => e.classroomId));
-    const classesWithoutStudents = allClasses.filter((c) => !enrolledClassroomIds.has(c.id)).length;
-
-    // Classrooms with 0 instructors
-    const instructors = await db.select().from(classroomInstructors);
-    const instructedClassroomIds = new Set(instructors.map((i) => i.classroomId));
-    const classesWithoutLecturers = allClasses.filter((c) => !instructedClassroomIds.has(c.id)).length;
-
-    return sendSuccess(reply, {
-      totalClassrooms: allClasses.length,
-      activeClassrooms,
-      draftClassrooms,
-      pendingApprovalClassrooms,
-      completedClassrooms,
-      totalLecturers,
-      totalStudents,
-      classesWithoutStudents,
-      classesWithoutLecturers,
-    });
-  });
-
-  // Lecturer Dashboard
-  fastify.get('/api/v1/dashboards/lecturer', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user || !isLecturerOrAdmin(user)) return sendError(reply, 403, 'FORBIDDEN', 'Dosen or Admin only');
-
-    // My classrooms
-    const myInstructed = await db
-      .select({
-        cls: classrooms,
-        course: courses,
-      })
-      .from(classroomInstructors)
-      .innerJoin(classrooms, eq(classroomInstructors.classroomId, classrooms.id))
-      .innerJoin(courses, eq(classrooms.courseId, courses.id))
-      .where(eq(classroomInstructors.instructorId, user.id));
-
-    const classroomIds = myInstructed.map((m) => m.cls.id);
-
-    // Pending enrollments across my classes
-    let pendingEnrollmentsCount = 0;
-    if (classroomIds.length > 0) {
-      const pendingRows = await db
-        .select({ id: classroomEnrollments.id })
-        .from(classroomEnrollments)
-        .where(
-          and(
-            inArray(classroomEnrollments.classroomId, classroomIds),
-            eq(classroomEnrollments.status, 'pending')
-          )
-        );
-      pendingEnrollmentsCount = pendingRows.length;
-    }
-
-    // Pending grading submissions
-    let pendingGradingCount = 0;
-    if (classroomIds.length > 0) {
-      const pendingSubmissions = await db
-        .select({ id: assignmentSubmissions.id })
-        .from(assignmentSubmissions)
-        .innerJoin(assignments, eq(assignmentSubmissions.assignmentId, assignments.id))
-        .where(
-          and(
-            inArray(assignments.classroomId, classroomIds),
-            eq(assignmentSubmissions.gradingStatus, 'SUBMITTED')
-          )
-        );
-      pendingGradingCount = pendingSubmissions.length;
-    }
-
-    return sendSuccess(reply, {
-      myClassroomsCount: myInstructed.length,
-      activeClassesCount: myInstructed.filter((m) => m.cls.lifecycleStatus === 'active').length,
-      pendingEnrollmentsCount,
-      pendingGradingCount,
-      classrooms: myInstructed.map((m) => ({
-        id: m.cls.id,
-        name: m.cls.name,
-        section: m.cls.section,
-        courseCode: m.course.code,
-        courseTitle: m.course.title,
-        status: m.cls.lifecycleStatus,
-      })),
-    });
-  });
-
-  // Student Dashboard
-  fastify.get('/api/v1/dashboards/student', async (req, reply) => {
+  // Get classroom waiting list
+  fastify.get('/api/v1/classrooms/:id/waitlist', async (req, reply) => {
     const user = await authenticateRequest(req, reply);
     if (!user) return;
+    const { id } = req.params as { id: string };
 
-    const myEnrollments = await db
+    const waitlist = await db
       .select({
-        enroll: classroomEnrollments,
-        cls: classrooms,
-        course: courses,
+        waitlist: classroomWaitlists,
+        student: users,
       })
-      .from(classroomEnrollments)
-      .innerJoin(classrooms, eq(classroomEnrollments.classroomId, classrooms.id))
-      .innerJoin(courses, eq(classrooms.courseId, courses.id))
-      .where(eq(classroomEnrollments.studentId, user.id));
+      .from(classroomWaitlists)
+      .innerJoin(users, eq(classroomWaitlists.studentId, users.id))
+      .where(eq(classroomWaitlists.classroomId, id))
+      .orderBy(asc(classroomWaitlists.queueNumber));
 
-    const activeEnrolls = myEnrollments.filter((e) => e.enroll.status === 'active');
-    const activeClassIds = activeEnrolls.map((e) => e.cls.id);
+    const enriched = waitlist.map((w) => ({
+      ...w.waitlist,
+      studentName: w.student.fullName,
+      studentEmail: w.student.email,
+      studentIdentityNumber: w.student.identityNumber,
+    }));
 
-    // Timetable
-    let schedules: any[] = [];
-    if (activeClassIds.length > 0) {
-      schedules = await db
-        .select({
-          schedule: classroomSchedules,
-          cls: classrooms,
-          room: campusRooms,
-          building: campusBuildings,
-        })
-        .from(classroomSchedules)
-        .innerJoin(classrooms, eq(classroomSchedules.classroomId, classrooms.id))
-        .leftJoin(campusRooms, eq(classroomSchedules.roomId, campusRooms.id))
-        .leftJoin(campusBuildings, eq(classroomSchedules.buildingId, campusBuildings.id))
-        .where(inArray(classroomSchedules.classroomId, activeClassIds))
-        .orderBy(asc(classroomSchedules.dayOfWeek), asc(classroomSchedules.startTime));
+    return sendSuccess(reply, enriched);
+  });
+
+  // Invite student to classroom
+  const createInvitationSchema = z.object({
+    studentId: z.string().uuid().optional(),
+    studentEmail: z.string().email().optional(),
+    message: z.string().optional().default('Undangan bergabung ke kelas digital Politeknik Kampar'),
+    expiresInDays: z.number().int().min(1).max(30).default(7),
+  });
+
+  fastify.post('/api/v1/classrooms/:id/invitations', async (req, reply) => {
+    const user = await authenticateRequest(req, reply);
+    if (!user || !isLecturerOrAdmin(user)) return sendError(reply, 403, 'FORBIDDEN', 'Dosen or Admin only');
+    const { id } = req.params as { id: string };
+
+    const parsed = createInvitationSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return sendError(reply, 400, 'VALIDATION_ERROR', 'Input undangan tidak valid.', parsed.error.issues);
     }
 
-    return sendSuccess(reply, {
-      enrolledCount: activeEnrolls.length,
-      pendingCount: myEnrollments.filter((e) => e.enroll.status === 'pending').length,
-      classrooms: activeEnrolls.map((e) => ({
-        id: e.cls.id,
-        name: e.cls.name,
-        section: e.cls.section,
-        courseCode: e.course.code,
-        courseTitle: e.course.title,
-        credits: e.course.credits,
-      })),
-      timetable: schedules.map((s) => ({
-        classroomId: s.cls.id,
-        classroomName: s.cls.name,
-        dayOfWeek: s.schedule.dayOfWeek,
-        startTime: s.schedule.startTime,
-        endTime: s.schedule.endTime,
-        roomNumber: s.room?.roomNumber || 'Online',
-        buildingCode: s.building?.code || '',
-        meetingType: s.schedule.meetingType,
-      })),
-    });
+    let targetStudentId = parsed.data.studentId;
+    if (!targetStudentId && parsed.data.studentEmail) {
+      const [u] = await db.select().from(users).where(eq(users.email, parsed.data.studentEmail.toLowerCase()));
+      if (!u) return sendError(reply, 404, 'STUDENT_NOT_FOUND', 'Mahasiswa dengan email tersebut tidak ditemukan.');
+      targetStudentId = u.id;
+    }
+    if (!targetStudentId) {
+      return sendError(reply, 400, 'VALIDATION_ERROR', 'studentId atau studentEmail wajib disertakan.');
+    }
+
+    const expiresAt = new Date(Date.now() + parsed.data.expiresInDays * 24 * 60 * 60 * 1000);
+    const [invitation] = await db
+      .insert(classroomInvitations)
+      .values({
+        classroomId: id,
+        studentId: targetStudentId,
+        invitedById: user.id,
+        status: 'PENDING',
+        invitationMessage: parsed.data.message,
+        expiresAt,
+      })
+      .returning();
+
+    return sendSuccess(reply, invitation, null, 201);
   });
+
 }

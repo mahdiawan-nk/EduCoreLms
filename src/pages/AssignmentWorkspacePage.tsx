@@ -22,6 +22,8 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { apiFetch } from '../lib/api';
+import { useAuth } from '../context/AuthContext';
+import { canPerformMutations, isAuditorUser } from '../lib/authorization';
 import { uploadSubmissionAttachmentToS3 } from '../lib/s3Upload';
 import {
   TiptapMaterialEditor,
@@ -76,10 +78,13 @@ export function AssignmentWorkspacePage() {
     enabled: Boolean(assignmentId),
   });
 
+  const { user } = useAuth();
+  const isAuditor = isAuditorUser(user);
+  const canMutate = canPerformMutations(user);
   const asg = assignmentQuery.data;
   const mySub = asg?.mySubmission;
   const cfg = asg?.submissionConfig || {};
-  const canManage = Boolean(asg?.access?.canManage);
+  const canManage = Boolean(asg?.access?.canManage) && canMutate;
 
   useEffect(() => {
     if (!mySub || initialized) return;
@@ -310,7 +315,21 @@ export function AssignmentWorkspacePage() {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            {canManage ? (
+            {isAuditor ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() =>
+                  navigate(
+                    `/classrooms/${classroomId}/assignments/${assignmentId}/monitoring`
+                  )
+                }
+              >
+                <Users className="h-3.5 w-3.5" />
+                <span>Monitoring Pengumpulan</span>
+              </Button>
+            ) : canManage ? (
               <>
                 <Button
                   type="button"
@@ -620,6 +639,7 @@ export function AssignmentWorkspacePage() {
 
           {/* RIGHT COLUMN: STUDENT SUBMISSION EDITOR & DISCUSSION */}
           <div className="lg:col-span-5 space-y-6">
+            {canMutate && !isAuditor ? (
             <section className="rounded-xl border border-slate-200 bg-white p-6 space-y-5">
               <div className="flex items-center justify-between border-b border-slate-100 pb-4">
                 <div>
@@ -847,6 +867,14 @@ export function AssignmentWorkspacePage() {
                 </Button>
               </div>
             </section>
+            ) : (
+              <section className="rounded-xl border border-amber-200 bg-amber-50/70 p-5 text-xs text-amber-950 space-y-1.5">
+                <p className="font-bold">Mode Auditor (Read-Only)</p>
+                <p className="text-amber-900">
+                  Anda sedang mengakses halaman tugas dalam mode audit hanya-baca. Pengumpulan jawaban, unggah berkas, dan perubahan data dinonaktifkan.
+                </p>
+              </section>
+            )}
 
             {/* STUDENT-INSTRUCTOR SUBMISSION DISCUSSION */}
             <section className="rounded-xl border border-slate-200 bg-white p-6 space-y-4">

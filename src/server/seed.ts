@@ -84,6 +84,12 @@ export async function ensureSeeded(): Promise<void> {
               description: 'Peserta didik aktif Politeknik Kampar yang mengikuti perkuliahan, tugas, kuis, dan diskusi.',
               isSystem: true,
             },
+            {
+              code: 'AUDITOR',
+              name: 'Auditor Akademik (Read-Only)',
+              description: 'Pengawas dan auditor internal dengan akses hanya-baca (read-only) untuk meninjau data akademik, kelas, nilai, dan log audit tanpa hak mutasi.',
+              isSystem: true,
+            },
           ])
           .returning();
 
@@ -92,7 +98,13 @@ export async function ensureSeeded(): Promise<void> {
         // 2. Insert Permissions & Role Permissions
         const insertedPerms = await tx
           .insert(permissions)
-          .values(PERMISSION_REGISTRY)
+          .values(
+            PERMISSION_REGISTRY.map(({ code, module, description }) => ({
+              code,
+              module,
+              description,
+            }))
+          )
           .returning();
 
         const permMap = new Map(insertedPerms.map((p) => [p.code, p.id]));

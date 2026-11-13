@@ -91,3 +91,85 @@ Student uploaded files and external links per submission version:
 - `essay_grades` & `essay_feedback`: Stores instructor manual scores (`DIRECT` or `RUBRIC`), per-criterion breakdowns, `is_draft`, `revision_number`, `audit_history` (`JSONB`), and student-visible vs. instructor-private feedback.
 - `assessment_results`: Aggregated student result per assessment (`best_attempt_id`, `latest_attempt_id`, `attempts_used`, `objective_score`, `essay_score`, `final_score`, `grading_status`, `is_published`), uniquely indexed on `(assessment_id, student_id)`.
 - `assessment_events`: Immutable telemetry & audit log (`ATTEMPT_STARTED`, `ATTEMPT_SUBMITTED`, `ATTEMPT_AUTO_SUBMITTED`, `ESSAY_DRAFT_SAVED`, `ESSAY_GRADED`, `RESULTS_PUBLISHED`).
+
+---
+
+## 4. Academic Classroom Management Schema (11 Domain Tables)
+
+### 4.1 `academic_periods` (Pure Semester Administration)
+- Stores institution-wide academic periods and semester lifecycles exclusively controlled by Superadmin.
+- **Fields**:
+  - `id`: UUID (Primary Key, `defaultRandom()`)
+  - `code`: text NOT NULL UNIQUE (academic_code, e.g. `20261`)
+  - `name`: text NOT NULL (e.g. `Semester Ganjil 2026/2027`)
+  - `academic_year`: text NOT NULL (e.g. `2026/2027`)
+  - `semester_type`: text NOT NULL (`ODD`, `EVEN`, `SHORT`)
+  - `description`: text NOT NULL DEFAULT ''
+  - `preparation_start_date`: timestamp with time zone (nullable)
+  - `start_date`: timestamp with time zone NOT NULL (lecture_start_date)
+  - `end_date`: timestamp with time zone NOT NULL (lecture_end_date)
+  - `status`: text NOT NULL DEFAULT 'DRAFT' (`DRAFT`, `SCHEDULED`, `ACTIVE`, `COMPLETED`, `ARCHIVED`)
+  - `is_default`: boolean NOT NULL DEFAULT false
+  - `administrative_notes`: text NOT NULL DEFAULT ''
+  - `created_by_id`: uuid REFERENCES `users(id)` ON DELETE SET NULL
+  - `metadata`: JSONB NOT NULL DEFAULT '{}'
+  - `created_at`: timestamp with time zone NOT NULL DEFAULT now()
+  - `updated_at`: timestamp with time zone NOT NULL DEFAULT now()
+- **Database Constraints & Indexes**:
+  - `idx_academic_periods_single_default`: UNIQUE INDEX ON `academic_periods(is_default)` WHERE `is_default = true` (enforces at most one default semester across the institution)
+  - `chk_academic_periods_semester_type`: CHECK (`semester_type` IN ('ODD', 'EVEN', 'SHORT'))
+  - `chk_academic_periods_status`: CHECK (`status` IN ('DRAFT', 'SCHEDULED', 'ACTIVE', 'COMPLETED', 'ARCHIVED'))
+  - `chk_academic_periods_dates`: CHECK (`start_date` < `end_date`)
+- **Purity & Non-destructive Guarantees**:
+  - Obsolete KRS registration fields (`registration_start`, `registration_end`) purged cleanly.
+  - Foreign keys from `classrooms` and `course_offerings` are preserved (`ON DELETE RESTRICT / SET NULL`).
+  - Deletion blocked if referenced by classrooms, course offerings, or if the period was ever activated.
+
+### 4.2 `academic_calendar_events`
+- Categorized institutional events tied to an academic period.
+- Fields: `id` (UUID PK), `academic_period_id` (FK -> `academic_periods`), `title`, `description`, `category` (`KRS_REGISTRATION`, `LECTURE_START`, `LECTURE_END`, `UTS`, `UAS`, `HOLIDAY`, `GRADE_SUBMISSION`, `GRADE_CORRECTION`, `REMEDIAL`, `REGISTRATION_DEADLINE`, `OTHER`), `start_date`, `end_date`, `is_holiday` (boolean), `visibility` (`ALL`, `LECTURER_ONLY`, `STUDENT_ONLY`, `ADMIN_ONLY`), `color` (hex string), `created_by_id` (FK -> `users`), `created_at`, `updated_at`.
+
+### 4.3 `classrooms` (Decoupled Autonomous Architecture)
+- Central digital learning environment, fully decoupled from master course and facility tables.
+- **Identity & Academic Metadata**: `id` (UUID PK), `name` (text), `classroom_code` (text), `subject_name` (text), `subject_code` (text), `academic_year` (text), `semester_name` (text), `location_description` (text), `section` (text), `cohort` (text), `classroom_type` (`REGULAR`, `PRACTICAL`, `HYBRID`, `SHORT_SEMESTER`, `REMEDIAL`), `min_capacity` (int), `max_capacity` (int), `capacity` (int), `category` (text), `language` (text), `visibility` (`PUBLIC_ENROLLED`, `CAMPUS_WIDE`, `PRIVATE_RESTRICTED`), `learning_objectives` (text), `cpmk` (text, dedicated learning outcomes / syllabus), `cover_image_key` (text), `cover_image_path` (text, standard WebP cover), `cover_thumbnail_path` (text, 480x270 WebP thumbnail), `cover_mime_type` (text, 'image/webp'), `cover_file_size` (int), `cover_width` (int), `cover_height` (int), `cover_updated_at` (timestamp with time zone), `description` (text, sanitized lightweight rich text).
+- **Lifecycle & Approvals**: `lifecycle_status` (`draft`, `pending_approval`, `scheduled`, `published`, `active`, `completed`, `archived`, `cancelled`), `approval_status` (`DRAFT`, `PENDING`, `APPROVED`, `REJECTED`), `scheduled_at`, `published_at`, `completed_at`, `archived_at`.
+- **Decoupled Foreign Keys**: `academic_period_id` (FK -> `academic_periods`), `course_id` (UUID nullable, `onDelete: 'set null'`), `semester_id` (UUID nullable, `onDelete: 'set null'`), `course_offering_id` (UUID nullable, `onDelete: 'set null'`).
+
+### 4.4 Legacy Historical Master Tables (Preserved for Historical Integrity)
+- `courses`, `course_offerings`, `campus_buildings`, `campus_rooms`: Preserved in the database schema to maintain referential integrity with historical audit logs and past academic cycles, but completely decoupled from active LMS runtime logic, routes, wizards, and navigation.
+
+### 4.5 `classroom_schedules`
+- Weekly recurring timetable slots with flexible physical and online location metadata.
+- Fields: `id` (UUID PK), `classroom_id` (FK -> `classrooms`), `day_of_week` (int 1-7, 1=Monday), `start_time` (varchar(10), e.g. `08:00`), `end_time` (varchar(10), e.g. `10:30`), `schedule_type` (`THEORY`, `PRACTICAL`, `TUTORIAL`, `SEMINAR`, `EXAM`), `location_description` (text, e.g. `Lab Komputer Lantai 2`, `Gedung Utama R-301`), `building_id` (FK nullable -> `campus_buildings`), `room_id` (FK nullable -> `campus_rooms`), `instructor_id` (FK -> `users`), `meeting_type` (`OFFLINE`, `ONLINE`, `HYBRID`), `online_link` (text), `created_at`, `updated_at`.
+- Conflict detection: Checked across overlapping day of week and 24h time ranges for instructor and room. Operates reliably without requiring a physical `room_id`.
+
+### 4.6 `classroom_enrollment_policies`
+- Per-classroom enrollment governance rules and quota controls.
+- Fields: `id` (UUID PK), `classroom_id` (FK -> `classrooms` UNIQUE), `enrollment_mode` (`AUTO`, `APPROVAL_REQUIRED`, `JOIN_CODE`), `min_participants` (int), `max_participants` (int), `waiting_list_enabled` (boolean), `max_waiting_list` (int), `join_code_max_uses` (int), `created_at`, `updated_at`.
+
+### 4.7 `classroom_waitlists`
+- First-In, First-Out (FIFO) queue for classrooms that have reached maximum student capacity.
+- Fields: `id` (UUID PK), `classroom_id` (FK -> `classrooms`), `student_id` (FK -> `users`), `queue_number` (int), `status` (`WAITING`, `PROMOTED`, `EXPIRED`, `CANCELLED`), `request_date` (timestamp), `promoted_at` (timestamp).
+- Unique constraint: Composite unique on `(classroom_id, student_id)`.
+
+### 4.8 `classroom_invitations`
+- Direct faculty or administrative invitations sent to students.
+- Fields: `id` (UUID PK), `classroom_id` (FK -> `classrooms`), `student_id` (FK -> `users`), `invited_by_id` (FK -> `users`), `status` (`PENDING`, `ACCEPTED`, `REJECTED`, `EXPIRED`), `invitation_message` (text), `expires_at` (timestamp), `responded_at` (timestamp), `created_at`.
+
+### 4.9 `classroom_approvals`
+- Workflow records for classrooms requiring administrative verification prior to activation.
+- Fields: `id` (UUID PK), `classroom_id` (FK -> `classrooms`), `requested_by_id` (FK -> `users`), `reviewer_id` (FK -> `users`), `status` (`PENDING`, `APPROVED`, `REJECTED`), `review_notes` (text), `requested_at` (timestamp), `reviewed_at` (timestamp).
+
+### 4.10 `classroom_events`
+- Immutable event stream logging classroom lifecycle transitions (`CLASSROOM_CREATED`, `CLASSROOM_SUBMITTED`, `CLASSROOM_APPROVED`, `CLASSROOM_PUBLISHED`, `CLASSROOM_COMPLETED`, `CLASSROOM_ARCHIVED`).
+- Fields: `id` (UUID PK), `classroom_id` (FK -> `classrooms`), `actor_id` (FK -> `users`), `event_type` (varchar(50)), `payload` (JSONB), `created_at`.
+
+### 4.11 `classroom_instructors` (Direct Classroom Teaching Team)
+- Replaces institutional lecturer assignment mapping by managing teaching teams directly per classroom.
+- Fields: `id` (UUID PK), `classroom_id` (FK -> `classrooms` CASCADE), `instructor_id` (FK -> `users` CASCADE), `role` (`PRIMARY_INSTRUCTOR`, `CO_INSTRUCTOR`, `TEACHING_ASSISTANT`), `is_primary` (boolean), `status` (`ACTIVE`, `PENDING_ACCEPTANCE`, `INACTIVE`), `assigned_at` (timestamp), `created_at`, `updated_at`.
+- Invariant: Exactly one primary instructor per classroom (`is_primary = true`). Scoped permissions govern classroom management without dependency on institutional course offerings.
+
+### 4.12 `classroom_join_codes` & Independent Enrollment
+- Concurrency-safe self-enrollment mechanism decoupled from semester KRS registration.
+- Fields: `id` (UUID PK), `classroom_id` (FK -> `classrooms` CASCADE), `code` (text UNIQUE), `is_active` (boolean), `max_uses` (int), `uses_count` (int), `expires_at` (timestamp), `created_at`, `updated_at`.
+- Transactional enrollment locks guarantee that `uses_count` is incremented safely and capacity/waitlists are enforced atomically.

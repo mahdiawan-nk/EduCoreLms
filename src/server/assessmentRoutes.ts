@@ -41,6 +41,7 @@ import {
   sendError,
   recordAuditLog,
 } from './security.ts';
+import { resolveClassroomRole, recordClassroomAudit } from './classroomWorkspaceRoutes.ts';
 import {
   validateAttachmentRequest,
   signPresignedPutUrl,
@@ -1116,6 +1117,8 @@ export async function registerAssessmentRoutes(fastify: FastifyInstance) {
   const createOrUpdateQuestionSchema = z.object({
     questionBankId: z.string().uuid().nullable().optional(),
     classroomId: z.string().uuid().nullable().optional(),
+    title: z.string().default(''),
+    status: z.enum(['DRAFT', 'READY', 'ARCHIVED']).default('READY'),
     questionMode: z.enum(['OBJECTIVE', 'ESSAY']).default('OBJECTIVE'),
     questionType: z.enum([
       'SINGLE_CHOICE',
@@ -1126,13 +1129,18 @@ export async function registerAssessmentRoutes(fastify: FastifyInstance) {
       'FILL_IN_BLANK',
       'SHORT_ANSWER',
       'NUMERIC',
+      'NUMERIC_TOLERANCE',
       'SHORT_ESSAY',
       'LONG_ESSAY',
+      'ESSAY_SHORT',
+      'ESSAY_LONG',
       'CASE_STUDY',
       'ANALYTICAL_RESPONSE',
       'PROBLEM_SOLVING',
       'PROGRAMMING_EXPLANATION',
+      'ALGORITHM_CODE',
       'DOCUMENT_RESPONSE',
+      'DOCUMENT_BASED_RESPONSE',
     ]),
     subject: z.string().default(''),
     topic: z.string().default(''),
@@ -1155,12 +1163,30 @@ export async function registerAssessmentRoutes(fastify: FastifyInstance) {
           optionText: z.string(),
           optionJson: z.any().optional(),
           imageObjectKey: z.string().nullable().optional(),
+          audioObjectKey: z.string().nullable().optional(),
           matchRightText: z.string().nullable().optional(),
           correctOrderIndex: z.number().int().nullable().optional(),
           isCorrect: z.boolean().default(false),
           scoreWeight: z.union([z.number(), z.string()]).default(100),
           feedback: z.string().default(''),
           sortOrder: z.number().int().optional(),
+        })
+      )
+      .optional(),
+    media: z
+      .array(
+        z.object({
+          mediaType: z.enum(['IMAGE', 'AUDIO']).default('IMAGE'),
+          objectKey: z.string(),
+          thumbnailKey: z.string().nullable().optional(),
+          originalName: z.string().default('media'),
+          optimizedFilename: z.string().nullable().optional(),
+          mimeType: z.string().default('application/octet-stream'),
+          fileSize: z.number().int().default(0),
+          width: z.number().int().nullable().optional(),
+          height: z.number().int().nullable().optional(),
+          durationSeconds: z.number().int().nullable().optional(),
+          caption: z.string().default(''),
         })
       )
       .optional(),
@@ -1210,13 +1236,18 @@ export async function registerAssessmentRoutes(fastify: FastifyInstance) {
     const isEssayType = [
       'SHORT_ESSAY',
       'LONG_ESSAY',
+      'ESSAY_SHORT',
+      'ESSAY_LONG',
       'CASE_STUDY',
       'ANALYTICAL_RESPONSE',
       'PROBLEM_SOLVING',
       'PROGRAMMING_EXPLANATION',
+      'ALGORITHM_CODE',
       'DOCUMENT_RESPONSE',
+      'DOCUMENT_BASED_RESPONSE',
     ].includes(d.questionType);
     const resolvedMode = isEssayType ? 'ESSAY' : d.questionMode;
+    const generatedCode = `SOAL-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 
     const result = await db.transaction(async (tx) => {
       const [createdQ] = await tx
@@ -1225,6 +1256,11 @@ export async function registerAssessmentRoutes(fastify: FastifyInstance) {
           questionBankId: d.questionBankId || null,
           classroomId: d.classroomId || null,
           authorId: user.id,
+          title: d.title || '',
+          questionCode: generatedCode,
+          status: d.status || 'READY',
+          sourceType: 'EDITOR',
+          tags: d.tags || [],
           questionMode: resolvedMode,
           questionType: d.questionType,
           subject: d.subject,
@@ -1264,6 +1300,7 @@ export async function registerAssessmentRoutes(fastify: FastifyInstance) {
               optionText: opt.optionText,
               optionJson: opt.optionJson || null,
               imageObjectKey: opt.imageObjectKey || null,
+              audioObjectKey: opt.audioObjectKey || null,
               matchRightText: opt.matchRightText || null,
               correctOrderIndex: opt.correctOrderIndex ?? null,
               isCorrect: opt.isCorrect,
@@ -1273,6 +1310,28 @@ export async function registerAssessmentRoutes(fastify: FastifyInstance) {
             })
             .returning();
           insertedOptions.push(insOpt);
+        }
+      }
+
+      if (d.media && d.media.length > 0) {
+        for (let i = 0; i < d.media.length; i++) {
+          const m = d.media[i];
+          await tx.insert(questionMedia).values({
+            questionId: createdQ.id,
+            mediaType: m.mediaType,
+            objectKey: m.objectKey,
+            thumbnailKey: m.thumbnailKey || null,
+            originalName: m.originalName,
+            optimizedFilename: m.optimizedFilename || null,
+            mimeType: m.mimeType,
+            fileSize: m.fileSize,
+            width: m.width ?? null,
+            height: m.height ?? null,
+            durationSeconds: m.durationSeconds ?? null,
+            caption: m.caption || '',
+            uploadedById: user.id,
+            sortOrder: i + 1,
+          });
         }
       }
 
@@ -2376,6 +2435,16 @@ export async function registerAssessmentRoutes(fastify: FastifyInstance) {
       return sendError(reply, 403, 'FORBIDDEN', 'Akses ditolak.');
     }
 
+    const roleInfo = await resolveClassroomRole(user, existing.classroomId);
+    if (roleInfo.role === 'CO_INSTRUCTOR' && !roleInfo.canManageAll && existing.authorId !== user.id) {
+      return sendError(
+        reply,
+        403,
+        'FORBIDDEN_CO_INSTRUCTOR_RESOURCE_OWNERSHIP',
+        'Co-Instructor tidak dapat mengubah asesmen milik pengajar lain tanpa izin.'
+      );
+    }
+
     const parsed = assessmentPayloadSchema.partial().safeParse(req.body);
     if (!parsed.success) {
       return sendError(
@@ -2480,6 +2549,26 @@ export async function registerAssessmentRoutes(fastify: FastifyInstance) {
       return upAsmt;
     });
 
+    let auditAction: 'UPDATED' | 'PUBLISHED' | 'UNPUBLISHED' | 'ARCHIVED' | 'RESTORED' = 'UPDATED';
+    if (updated.status !== existing.status) {
+      if (existing.status === 'ARCHIVED' && updated.status !== 'ARCHIVED') auditAction = 'RESTORED';
+      else if (updated.status === 'PUBLISHED') auditAction = 'PUBLISHED';
+      else if (updated.status === 'ARCHIVED') auditAction = 'ARCHIVED';
+      else auditAction = 'UNPUBLISHED';
+    }
+    await recordClassroomAudit({
+      classroomId: existing.classroomId,
+      actorId: user.id,
+      actorRole: roleInfo.role,
+      resourceType: 'ASSESSMENT',
+      resourceId: id,
+      resourceTitle: updated.title,
+      action: auditAction,
+      beforeValue: { title: existing.title, status: existing.status },
+      afterValue: { title: updated.title, status: updated.status },
+      changeSummary: `Memperbarui asesmen: "${updated.title}"`,
+    });
+
     return sendSuccess(reply, { assessment: updated });
   });
 
@@ -2509,6 +2598,16 @@ export async function registerAssessmentRoutes(fastify: FastifyInstance) {
     const access = await checkClassroomAccess(user, existing.classroomId);
     if (!access.canManage) {
       return sendError(reply, 403, 'FORBIDDEN', 'Akses ditolak.');
+    }
+
+    const roleInfo = await resolveClassroomRole(user, existing.classroomId);
+    if (roleInfo.role === 'CO_INSTRUCTOR' && !roleInfo.canManageAll && existing.authorId !== user.id) {
+      return sendError(
+        reply,
+        403,
+        'FORBIDDEN_CO_INSTRUCTOR_RESOURCE_OWNERSHIP',
+        'Co-Instructor tidak dapat mengubah asesmen milik pengajar lain tanpa izin.'
+      );
     }
 
     const nextStatus = body.status || 'PUBLISHED';

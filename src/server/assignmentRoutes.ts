@@ -38,6 +38,7 @@ import {
   sendError,
   recordAuditLog,
 } from './security.ts';
+import { resolveClassroomRole, recordClassroomAudit } from './classroomWorkspaceRoutes.ts';
 import {
   validateAttachmentRequest,
   signPresignedPutUrl,
@@ -1277,6 +1278,16 @@ export async function registerAssignmentRoutes(fastify: FastifyInstance) {
       );
     }
 
+    const roleInfo = await resolveClassroomRole(user, existing.classroomId);
+    if (roleInfo.role === 'CO_INSTRUCTOR' && !roleInfo.canManageAll && existing.authorId !== user.id) {
+      return sendError(
+        reply,
+        403,
+        'FORBIDDEN_CO_INSTRUCTOR_RESOURCE_OWNERSHIP',
+        'Co-Instructor tidak dapat mengubah tugas milik pengajar lain tanpa izin.'
+      );
+    }
+
     const parsed = createOrUpdateAssignmentSchema.partial().safeParse(req.body);
     if (!parsed.success) {
       return sendError(
@@ -1455,6 +1466,26 @@ export async function registerAssignmentRoutes(fastify: FastifyInstance) {
       return upAsg;
     });
 
+    let auditAction: 'UPDATED' | 'PUBLISHED' | 'UNPUBLISHED' | 'ARCHIVED' | 'RESTORED' = 'UPDATED';
+    if (updated.status !== existing.status) {
+      if (existing.status === 'ARCHIVED' && updated.status !== 'ARCHIVED') auditAction = 'RESTORED';
+      else if (updated.status === 'PUBLISHED') auditAction = 'PUBLISHED';
+      else if (updated.status === 'ARCHIVED') auditAction = 'ARCHIVED';
+      else auditAction = 'UNPUBLISHED';
+    }
+    await recordClassroomAudit({
+      classroomId: existing.classroomId,
+      actorId: user.id,
+      actorRole: roleInfo.role,
+      resourceType: 'ASSIGNMENT',
+      resourceId: id,
+      resourceTitle: updated.title,
+      action: auditAction,
+      beforeValue: { title: existing.title, status: existing.status, dueAt: existing.dueAt },
+      afterValue: { title: updated.title, status: updated.status, dueAt: updated.dueAt },
+      changeSummary: `Memperbarui tugas: "${updated.title}"`,
+    });
+
     return sendSuccess(reply, {
       ...updated,
       maxScore: updated.maxPoints,
@@ -1479,7 +1510,28 @@ export async function registerAssignmentRoutes(fastify: FastifyInstance) {
       return sendError(reply, 403, 'FORBIDDEN', 'Hanya Dosen yang dapat menghapus tugas.');
     }
 
+    const roleInfo = await resolveClassroomRole(user, existing.classroomId);
+    if (roleInfo.role === 'CO_INSTRUCTOR' && !roleInfo.canManageAll && existing.authorId !== user.id) {
+      return sendError(
+        reply,
+        403,
+        'FORBIDDEN_CO_INSTRUCTOR_RESOURCE_OWNERSHIP',
+        'Co-Instructor tidak dapat menghapus tugas milik pengajar lain tanpa izin.'
+      );
+    }
+
     await db.delete(assignments).where(eq(assignments.id, id));
+    await recordClassroomAudit({
+      classroomId: existing.classroomId,
+      actorId: user.id,
+      actorRole: roleInfo.role,
+      resourceType: 'ASSIGNMENT',
+      resourceId: id,
+      resourceTitle: existing.title,
+      action: 'DELETED',
+      beforeValue: { title: existing.title, status: existing.status },
+      changeSummary: `Menghapus tugas "${existing.title}"`,
+    });
     return sendSuccess(reply, { deleted: true, id });
   });
 

@@ -22,6 +22,7 @@ import {
   FileCheck,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import { ModalDialog } from '../components/ui/primitives';
 
 export const AssignmentMonitoringPage: React.FC = () => {
   const { classroomId, assignmentId } = useParams<{ classroomId: string; assignmentId: string }>();
@@ -598,59 +599,49 @@ export const AssignmentMonitoringPage: React.FC = () => {
       </main>
 
       {/* Reminder Modal */}
-      {showReminderModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl border border-slate-200 max-w-md w-full p-6 shadow-xl space-y-4">
-            <div className="flex items-center justify-between">
-              <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                <Bell className="w-4 h-4 text-amber-600" />
-                Kirim Pengingat Tugas
-              </h3>
-              <button
-                type="button"
-                onClick={() => setShowReminderModal(false)}
-                className="p-1 text-slate-400 hover:text-slate-600"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <p className="text-xs text-slate-600">
-              {selectedStudentIds.length > 0
-                ? `Mengirim pengingat ke ${selectedStudentIds.length} mahasiswa terpilih.`
-                : `Mengirim pengingat otomatis ke seluruh mahasiswa yang belum mengumpulkan tugas (${summary?.notSubmitted || 0} mahasiswa).`}
-            </p>
-            <div>
-              <label className="block text-xs font-bold text-slate-700 mb-1">
-                Pesan Pengingat
-              </label>
-              <textarea
-                rows={3}
-                value={reminderMessage}
-                onChange={(e) => setReminderMessage(e.target.value)}
-                className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs"
-              />
-            </div>
-            <div className="flex items-center justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setShowReminderModal(false)}
-                className="px-4 py-2 rounded-lg border border-slate-300 text-xs font-semibold text-slate-700"
-              >
-                Batal
-              </button>
-              <button
-                type="button"
-                disabled={sendingReminders}
-                onClick={handleSendReminders}
-                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-slate-950 text-xs font-bold"
-              >
-                <Send className="w-3.5 h-3.5" />
-                {sendingReminders ? 'Mengirim...' : 'Kirim Pengingat'}
-              </button>
-            </div>
+      <ModalDialog
+        open={showReminderModal}
+        onClose={() => setShowReminderModal(false)}
+        title="Kirim Pengingat Tugas"
+        description={
+          selectedStudentIds.length > 0
+            ? `Mengirim pengingat ke ${selectedStudentIds.length} mahasiswa terpilih.`
+            : `Mengirim pengingat otomatis ke seluruh mahasiswa yang belum mengumpulkan tugas (${summary?.notSubmitted || 0} mahasiswa).`
+        }
+        maxWidth="max-w-md"
+      >
+        <div className="space-y-4">
+          <div>
+            <label className="block text-xs font-bold text-slate-700 mb-1">
+              Pesan Pengingat
+            </label>
+            <textarea
+              rows={3}
+              value={reminderMessage}
+              onChange={(e) => setReminderMessage(e.target.value)}
+              className="w-full px-3 py-2 rounded-lg border border-slate-300 text-xs"
+            />
+          </div>
+          <div className="flex items-center justify-end gap-2 pt-2">
+            <button
+              type="button"
+              onClick={() => setShowReminderModal(false)}
+              className="px-4 py-2 rounded-lg border border-slate-300 text-xs font-semibold text-slate-700 cursor-pointer"
+            >
+              Batal
+            </button>
+            <button
+              type="button"
+              disabled={sendingReminders}
+              onClick={handleSendReminders}
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-slate-950 text-xs font-bold cursor-pointer"
+            >
+              <Send className="w-3.5 h-3.5" />
+              {sendingReminders ? 'Mengirim...' : 'Kirim Pengingat'}
+            </button>
           </div>
         </div>
-      )}
+      </ModalDialog>
     </div>
   );
 };

@@ -13,6 +13,7 @@ import {
   materialVideos,
   materialProgress,
   materialRevisions,
+  classroomResourceVersions,
   comments,
   users,
   assignments,
@@ -25,6 +26,7 @@ import {
   sendError,
   recordAuditLog,
 } from './security.ts';
+import { resolveClassroomRole, recordClassroomAudit } from './classroomWorkspaceRoutes.ts';
 import {
   validateAttachmentRequest,
   generateObjectKey,
@@ -772,7 +774,32 @@ export async function registerMaterialRoutes(fastify: FastifyInstance) {
         editedBy: user.id,
       });
 
+      await tx.insert(classroomResourceVersions).values({
+        classroomId: topic.classroomId,
+        resourceType: 'MATERIAL',
+        resourceId: mat.id,
+        versionNumber: 1,
+        title: mat.title,
+        contentJson: canonicalJson,
+        contentHtml: mat.contentHtml,
+        createdById: user.id,
+        changeNotes: 'Versi awal materi',
+      });
+
       return mat;
+    });
+
+    const roleInfo = await resolveClassroomRole(user, topic.classroomId);
+    await recordClassroomAudit({
+      classroomId: topic.classroomId,
+      actorId: user.id,
+      actorRole: roleInfo.role,
+      resourceType: 'MATERIAL',
+      resourceId: created.id,
+      resourceTitle: created.title,
+      action: created.status === 'PUBLISHED' ? 'PUBLISHED' : 'CREATED',
+      afterValue: { title: created.title, status: created.status, topicId: created.topicId },
+      changeSummary: `Membuat materi pembelajaran: "${created.title}"`,
     });
 
     await recordAuditLog({
@@ -1157,6 +1184,17 @@ export async function registerMaterialRoutes(fastify: FastifyInstance) {
       );
     }
 
+    const roleInfo = await resolveClassroomRole(user, existing.classroomId);
+    const ownerId = existing.createdBy || existing.authorId;
+    if (roleInfo.role === 'CO_INSTRUCTOR' && !roleInfo.canManageAll && ownerId !== user.id) {
+      return sendError(
+        reply,
+        403,
+        'FORBIDDEN_CO_INSTRUCTOR_RESOURCE_OWNERSHIP',
+        'Co-Instructor tidak dapat mengubah materi yang dibuat oleh pengajar lain tanpa izin.'
+      );
+    }
+
     const parsed = updateMaterialSchema.safeParse(req.body);
     if (!parsed.success) {
       return sendError(
@@ -1279,12 +1317,51 @@ export async function registerMaterialRoutes(fastify: FastifyInstance) {
         });
       }
 
+      const existingVersions = await tx
+        .select({ versionNumber: classroomResourceVersions.versionNumber })
+        .from(classroomResourceVersions)
+        .where(eq(classroomResourceVersions.resourceId, id))
+        .orderBy(desc(classroomResourceVersions.versionNumber))
+        .limit(1);
+      const nextVer = (existingVersions[0]?.versionNumber || 0) + 1;
+      await tx.insert(classroomResourceVersions).values({
+        classroomId: existing.classroomId,
+        resourceType: 'MATERIAL',
+        resourceId: id,
+        versionNumber: nextVer,
+        title: row.title,
+        contentJson: row.contentJson,
+        contentHtml: row.contentHtml,
+        createdById: user.id,
+        changeNotes: `Pembaruan materi v${nextVer}`,
+      });
+
       return {
         ...row,
         shortDescription: row.description,
         estimatedDurationMinutes: row.estimatedDuration,
         versionNumber: d.createRevision ? nextRevNum : prevRevs.length || 1,
       };
+    });
+
+    let auditAction: 'UPDATED' | 'PUBLISHED' | 'UNPUBLISHED' | 'ARCHIVED' | 'RESTORED' = 'UPDATED';
+    if (d.status && d.status !== existing.status) {
+      if (existing.status === 'ARCHIVED' && d.status !== 'ARCHIVED') auditAction = 'RESTORED';
+      else if (d.status === 'PUBLISHED') auditAction = 'PUBLISHED';
+      else if (d.status === 'ARCHIVED') auditAction = 'ARCHIVED';
+      else auditAction = 'UNPUBLISHED';
+    }
+    await recordClassroomAudit({
+      classroomId: existing.classroomId,
+      actorId: user.id,
+      actorRole: roleInfo.role,
+      resourceType: 'MATERIAL',
+      resourceId: id,
+      resourceTitle: updated.title,
+      action: auditAction,
+      beforeValue: { title: existing.title, status: existing.status, topicId: existing.topicId },
+      afterValue: { title: updated.title, status: updated.status, topicId: updated.topicId },
+      changeSummary: `Memperbarui materi: "${updated.title}"`,
     });
 
     return sendSuccess(reply, updated);
@@ -1316,6 +1393,17 @@ export async function registerMaterialRoutes(fastify: FastifyInstance) {
       );
     }
 
+    const roleInfo = await resolveClassroomRole(user, existing.classroomId);
+    const ownerId = existing.createdBy || existing.authorId;
+    if (roleInfo.role === 'CO_INSTRUCTOR' && !roleInfo.canManageAll && ownerId !== user.id) {
+      return sendError(
+        reply,
+        403,
+        'FORBIDDEN_CO_INSTRUCTOR_RESOURCE_OWNERSHIP',
+        'Co-Instructor tidak dapat menghapus materi milik pengajar lain tanpa izin.'
+      );
+    }
+
     const atts = await db
       .select()
       .from(materialAttachments)
@@ -1325,6 +1413,18 @@ export async function registerMaterialRoutes(fastify: FastifyInstance) {
     }
 
     await db.delete(learningMaterials).where(eq(learningMaterials.id, id));
+
+    await recordClassroomAudit({
+      classroomId: existing.classroomId,
+      actorId: user.id,
+      actorRole: roleInfo.role,
+      resourceType: 'MATERIAL',
+      resourceId: id,
+      resourceTitle: existing.title,
+      action: 'DELETED',
+      beforeValue: { title: existing.title, status: existing.status, topicId: existing.topicId },
+      changeSummary: `Menghapus materi "${existing.title}"`,
+    });
 
     await recordAuditLog({
       actorId: user.id,

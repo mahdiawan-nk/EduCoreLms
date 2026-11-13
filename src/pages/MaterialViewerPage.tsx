@@ -4,13 +4,18 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeft, ArrowRight, CheckCircle2, Clock, FileText, FileSpreadsheet,
   Presentation, Image as ImageIcon, Film, Download, Eye, MessageSquare,
-  Send, Edit3, ShieldCheck, BookOpen, Play, Sparkles, ZoomIn
+  Send, Edit3, ShieldCheck, BookOpen, Play, Sparkles, ZoomIn,
+  Bookmark, StickyNote, History, RotateCcw, Menu
 } from 'lucide-react';
-import { apiFetch } from '../lib/api';
+import { apiFetch, apiRequest } from '../lib/api';
 import { AppShell } from '../components/AppShell';
 import { useAuth } from '../context/AuthContext';
+import { canPerformMutations, isAuditorUser } from '../lib/authorization';
 import { TiptapReadOnlyRenderer } from '../components/TiptapMaterialEditor';
 import { DocumentPreviewModal, formatBytes } from '../components/DocumentPreviewModal';
+import { QuickNavigationSidebar } from '../components/classroom/QuickNavigationSidebar';
+import { ModalDialog } from '../components/ui/primitives';
+import { toast } from 'sonner';
 
 export function MaterialViewerPage() {
   const { classroomId, materialId } = useParams<{
@@ -24,11 +29,17 @@ export function MaterialViewerPage() {
   const [previewAttachmentId, setPreviewAttachmentId] = useState<string | null>(null);
   const [commentText, setCommentText] = useState('');
   const [videoPlaybackRates, setVideoPlaybackRates] = useState<Record<string, number>>({});
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [versionsOpen, setVersionsOpen] = useState(false);
+  const [noteDraft, setNoteDraft] = useState('');
+  const [noteInitialized, setNoteInitialized] = useState(false);
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
   const lastProgressSyncRef = useRef<number>(0);
 
+  const isAuditor = isAuditorUser(user);
+  const canMutate = canPerformMutations(user);
   const isInstructorOrAdmin =
-    user?.roles.includes('SUPERADMIN') || user?.roles.includes('DOSEN');
+    canMutate && (user?.roles.includes('SUPERADMIN') || user?.roles.includes('DOSEN'));
 
   const {
     data: material,
@@ -59,19 +70,106 @@ export function MaterialViewerPage() {
     },
   });
 
-  // Record initial view / scroll progress when student opens material
+  // Record initial view (do NOT auto-mark COMPLETED merely on open; skip for AUDITOR read-only)
   useEffect(() => {
-    if (!material || !materialId) return;
+    if (!material || !materialId || !canMutate) return;
+    apiFetch(`/api/v1/materials/${materialId}/view`, { method: 'POST', body: JSON.stringify({}) }).catch(() => {});
     const currentProgress = material.myProgress;
     if (!currentProgress || currentProgress.status === 'NOT_STARTED') {
-      const targetPct = material.completionRule === 'VIEW' ? 100 : 25;
       progressMutation.mutate({
-        status: material.completionRule === 'VIEW' ? 'COMPLETED' : 'IN_PROGRESS',
-        progressPercent: targetPct,
+        status: 'IN_PROGRESS',
+        progressPercent: 25,
         scrollPercent: 25,
       });
     }
-  }, [material?.id]);
+  }, [material?.id, canMutate]);
+
+  const effectiveClassroomId = classroomId || material?.classroomId;
+
+  // Bookmarks query (for students, disabled for AUDITOR)
+  const bookmarksQuery = useQuery({
+    queryKey: ['classroom-bookmarks', effectiveClassroomId],
+    queryFn: () => apiFetch<any>(`/api/v1/classrooms/${effectiveClassroomId}/bookmarks`),
+    enabled: Boolean(effectiveClassroomId && !isInstructorOrAdmin && canMutate),
+  });
+  const isBookmarked = Boolean(
+    (bookmarksQuery.data?.bookmarks || []).some((b: any) => b.materialId === materialId)
+  );
+
+  const bookmarkMutation = useMutation({
+    mutationFn: (shouldBookmark: boolean) =>
+      apiFetch(`/api/v1/materials/${materialId}/bookmark`, {
+        method: shouldBookmark ? 'POST' : 'DELETE',
+        body: shouldBookmark ? JSON.stringify({}) : undefined,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['classroom-bookmarks', effectiveClassroomId] });
+      toast.success(isBookmarked ? 'Bookmark dihapus.' : 'Materi ditandai (bookmark).');
+    },
+  });
+
+  // Personal private note query (for students, disabled for AUDITOR)
+  const noteQuery = useQuery({
+    queryKey: ['material-note', materialId],
+    queryFn: () => apiFetch<any>(`/api/v1/materials/${materialId}/note`),
+    enabled: Boolean(materialId && !isInstructorOrAdmin && canMutate),
+  });
+
+  useEffect(() => {
+    if (noteQuery.data && !noteInitialized) {
+      setNoteDraft(noteQuery.data.note?.content || '');
+      setNoteInitialized(true);
+    }
+  }, [noteQuery.data, noteInitialized]);
+
+  const saveNoteMutation = useMutation({
+    mutationFn: (content: string) =>
+      apiFetch(`/api/v1/materials/${materialId}/note`, {
+        method: 'PUT',
+        body: JSON.stringify({ content }),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['material-note', materialId] });
+      toast.success('Catatan pribadi berhasil disimpan.');
+    },
+  });
+
+  // Instructor versions query
+  const versionsQuery = useQuery({
+    queryKey: ['material-versions', materialId],
+    queryFn: () => apiFetch<any>(`/api/v1/materials/${materialId}/versions`),
+    enabled: Boolean(materialId && isInstructorOrAdmin && versionsOpen),
+  });
+
+  const restoreVersionMutation = useMutation({
+    mutationFn: (versionId: string) =>
+      apiFetch(`/api/v1/materials/${materialId}/versions/${versionId}/restore`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['material-detail', materialId] });
+      queryClient.invalidateQueries({ queryKey: ['material-versions', materialId] });
+      toast.success('Versi materi berhasil dipulihkan.');
+      setVersionsOpen(false);
+    },
+    onError: (err: any) => toast.error(err?.message || 'Gagal memulihkan versi.'),
+  });
+
+  const completionMutation = useMutation({
+    mutationFn: (completed: boolean) =>
+      apiFetch(`/api/v1/materials/${materialId}/completion`, {
+        method: 'POST',
+        body: JSON.stringify({ completed }),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['material-detail', materialId] });
+      queryClient.invalidateQueries({ queryKey: ['classroom-detail', effectiveClassroomId] });
+      queryClient.invalidateQueries({ queryKey: ['classroom-analytics', effectiveClassroomId] });
+      queryClient.invalidateQueries({ queryKey: ['classwork-navigation', effectiveClassroomId] });
+      toast.success('Status penyelesaian materi diperbarui.');
+    },
+  });
 
   // Comment mutation
   const commentMutation = useMutation({
@@ -128,6 +226,7 @@ export function MaterialViewerPage() {
 
   const handleOpenPreview = (attId: string) => {
     setPreviewAttachmentId(attId);
+    if (!canMutate) return;
     const nextPct =
       material.completionRule === 'ATTACHMENT_OPEN'
         ? 100
@@ -139,6 +238,7 @@ export function MaterialViewerPage() {
   };
 
   const handleVideoTimeUpdate = (currentTime: number, duration: number) => {
+    if (!canMutate) return;
     const now = Date.now();
     if (now - lastProgressSyncRef.current < 5000) return;
     lastProgressSyncRef.current = now;
@@ -154,10 +254,25 @@ export function MaterialViewerPage() {
 
   return (
     <AppShell breadcrumb={material.title}>
-      <div className="max-w-6xl mx-auto space-y-6 pb-16">
+      <div className="max-w-7xl mx-auto flex gap-6 pb-16">
+        <QuickNavigationSidebar
+          classroomId={effectiveClassroomId}
+          activeMaterialId={material.id}
+          canManage={Boolean(isInstructorOrAdmin)}
+          mobileOpen={mobileNavOpen}
+          onMobileClose={() => setMobileNavOpen(false)}
+        />
+        <div className="flex-1 min-w-0 space-y-6">
         {/* Top Navigation & Progress Status Bar */}
       <div className="bg-white rounded-xl border border-slate-200 px-5 py-4 shadow-xs flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => setMobileNavOpen(true)}
+            className="lg:hidden inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 text-xs font-semibold text-slate-700"
+          >
+            <Menu className="w-3.5 h-3.5" /> Navigasi
+          </button>
           <Link
             to={`/classrooms/${classroomId || material.classroomId}`}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 text-xs font-semibold text-slate-700 transition"
@@ -201,39 +316,55 @@ export function MaterialViewerPage() {
             </div>
           </div>
 
-          {/* Mark Completed Button */}
-          {myProgress.status !== 'COMPLETED' ? (
+          {/* Mark Completed Button (Hidden for AUDITOR Read-Only) */}
+          {canMutate &&
+            (myProgress.status !== 'COMPLETED' ? (
+              <button
+                type="button"
+                onClick={() => completionMutation.mutate(true)}
+                disabled={completionMutation.isPending}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold transition shadow-xs cursor-pointer"
+              >
+                <CheckCircle2 className="w-4 h-4" /> Tandai Selesai
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => completionMutation.mutate(false)}
+                disabled={completionMutation.isPending}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-bold transition cursor-pointer"
+              >
+                <CheckCircle2 className="w-4 h-4 text-emerald-600" /> Selesai
+              </button>
+            ))}
+
+          {!isInstructorOrAdmin && canMutate && (
             <button
               type="button"
-              onClick={() =>
-                progressMutation.mutate({
-                  status: 'COMPLETED',
-                  progressPercent: 100,
-                  scrollPercent: 100,
-                })
-              }
-              disabled={progressMutation.isPending}
-              className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold transition shadow-xs"
+              onClick={() => bookmarkMutation.mutate(!isBookmarked)}
+              disabled={bookmarkMutation.isPending}
+              className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border text-xs font-bold transition cursor-pointer ${
+                isBookmarked
+                  ? 'border-amber-300 bg-amber-50 text-amber-800'
+                  : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+              }`}
             >
-              <CheckCircle2 className="w-4 h-4" /> Tandai Selesai Dipelajari
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={() =>
-                progressMutation.mutate({
-                  status: 'IN_PROGRESS',
-                  progressPercent: 50,
-                })
-              }
-              disabled={progressMutation.isPending}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-bold transition"
-            >
-              <CheckCircle2 className="w-4 h-4 text-emerald-600" /> Materi Telah Tuntas
+              <Bookmark className="w-3.5 h-3.5" />
+              {isBookmarked ? 'Ditandai' : 'Bookmark'}
             </button>
           )}
 
-          {isInstructorOrAdmin && (
+          {(isInstructorOrAdmin || isAuditor) && (
+            <button
+              type="button"
+              onClick={() => setVersionsOpen(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold transition cursor-pointer"
+            >
+              <History className="w-3.5 h-3.5" /> Versi
+            </button>
+          )}
+
+          {isInstructorOrAdmin && canMutate && (
             <Link
               to={`/classrooms/${classroomId || material.classroomId}/materials/${material.id}/edit`}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold transition"
@@ -632,6 +763,33 @@ export function MaterialViewerPage() {
         )}
       </div>
 
+      {/* Personal Private Notes (Student Only, hidden for AUDITOR Read-Only) */}
+      {!isInstructorOrAdmin && canMutate && (
+        <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-xs space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+              <StickyNote className="w-4 h-4 text-amber-600" />
+              Catatan Belajar Pribadi (Hanya Anda yang dapat melihat)
+            </h2>
+            <button
+              type="button"
+              disabled={saveNoteMutation.isPending}
+              onClick={() => saveNoteMutation.mutate(noteDraft)}
+              className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold cursor-pointer"
+            >
+              {saveNoteMutation.isPending ? 'Menyimpan...' : 'Simpan Catatan'}
+            </button>
+          </div>
+          <textarea
+            rows={4}
+            value={noteDraft}
+            onChange={(e) => setNoteDraft(e.target.value)}
+            placeholder="Tulis rangkuman, poin penting, atau pertanyaan pribadi untuk materi ini..."
+            className="w-full rounded-lg border border-slate-300 p-3 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-900"
+          />
+        </div>
+      )}
+
       {/* Material Comments / Academic Discussion */}
       {material.enableComments !== false && (
         <div className="bg-white rounded-xl border border-slate-200 p-6 sm:p-8 shadow-xs space-y-5">
@@ -644,14 +802,15 @@ export function MaterialViewerPage() {
             </div>
           </div>
 
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (!commentText.trim()) return;
-              commentMutation.mutate(commentText.trim());
-            }}
-            className="flex gap-3"
-          >
+          {canMutate && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (!commentText.trim()) return;
+                commentMutation.mutate(commentText.trim());
+              }}
+              className="flex gap-3"
+            >
             <input
               type="text"
               value={commentText}
@@ -667,6 +826,7 @@ export function MaterialViewerPage() {
               <Send className="w-3.5 h-3.5 text-amber-400" /> Kirim Tanggapan
             </button>
           </form>
+          )}
 
           <div className="space-y-3">
             {(material.comments || []).length === 0 ? (
@@ -704,6 +864,48 @@ export function MaterialViewerPage() {
           onVideoProgress={handleVideoTimeUpdate}
         />
       )}
+
+      {/* Instructor Material Versions Modal */}
+      <ModalDialog
+        open={versionsOpen}
+        onClose={() => setVersionsOpen(false)}
+        title="Riwayat Versi Konten Materi"
+      >
+        <div className="space-y-3 max-h-[65vh] overflow-y-auto">
+          {versionsQuery.isLoading ? (
+            <p className="text-xs text-slate-500">Memuat versi...</p>
+          ) : (versionsQuery.data?.versions || []).length === 0 ? (
+            <p className="text-xs text-slate-500">Belum ada riwayat versi tersimpan.</p>
+          ) : (
+            (versionsQuery.data?.versions || []).map((v: any) => (
+              <div
+                key={v.id}
+                className="p-3 rounded-lg border border-slate-200 flex items-center justify-between gap-3"
+              >
+                <div className="min-w-0">
+                  <p className="text-xs font-bold text-slate-900">
+                    Versi v{v.versionNumber} — {v.title}
+                  </p>
+                  <p className="text-[11px] text-slate-500">
+                    {v.createdByName || 'Pengajar'} · {v.changeNotes || 'Pembaruan'}
+                  </p>
+                </div>
+                {canMutate && (
+                  <button
+                    type="button"
+                    disabled={restoreVersionMutation.isPending}
+                    onClick={() => restoreVersionMutation.mutate(v.id)}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 hover:bg-slate-100 text-xs font-semibold text-slate-800 shrink-0 cursor-pointer"
+                  >
+                    <RotateCcw className="w-3 h-3" /> Pulihkan
+                  </button>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      </ModalDialog>
+        </div>
       </div>
     </AppShell>
   );

@@ -3,6 +3,11 @@ import { z } from 'zod';
 import { eq, and, desc, asc, ilike, or, sql } from 'drizzle-orm';
 import { db } from '../db/index.ts';
 import {
+  validatePasswordPolicy,
+  checkPasswordReuse,
+  recordPasswordInHistory,
+} from './passwordPolicy.ts';
+import {
   users,
   userProfiles,
   roles,
@@ -37,6 +42,7 @@ import {
   gradeItems,
   gradeRecords,
   userSessions,
+  impersonationSessions,
   notifications,
   auditLogs,
   assessments,
@@ -59,6 +65,9 @@ import {
   checkClassroomAccess,
   getUserWithRolesAndPermissions,
   recordAuditLog,
+  PERMISSION_MAP_BY_CODE,
+  ensureRbacInitialized,
+  isAuditorOnly,
 } from './security.ts';
 import { ensureSeeded } from './seed.ts';
 import { openApiSpec } from './openapi.ts';
@@ -68,23 +77,30 @@ import { getOrCreateUser } from '../db/users.ts';
 const isProd = process.env.NODE_ENV === 'production';
 
 function setSessionCookies(
+  req: any,
   reply: any,
   rawSessionToken: string,
   csrfToken: string,
   expiresAt: Date
 ) {
+  const isHttps = req.protocol === 'https' || req.headers?.['x-forwarded-proto'] === 'https';
+  // Use Secure cookies only when running in production over HTTPS.
+  // In local development (HTTP on localhost or LAN), browsers reject Secure cookies,
+  // causing auth sessions to be dropped.
+  const secure = isProd && isHttps;
+
   reply.setCookie(SESSION_COOKIE_NAME, rawSessionToken, {
     path: '/',
     httpOnly: true,
-    secure: true,
-    sameSite: 'none',
+    secure,
+    sameSite: secure ? 'none' : 'lax',
     expires: expiresAt,
   });
   reply.setCookie(CSRF_COOKIE_NAME, csrfToken, {
     path: '/',
     httpOnly: false,
-    secure: true,
-    sameSite: 'none',
+    secure,
+    sameSite: secure ? 'none' : 'lax',
     expires: expiresAt,
   });
 }
@@ -169,6 +185,26 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
 
       clearLoginRateLimit(rateKey);
 
+      if (
+        user.mustResetPassword &&
+        user.temporaryPasswordExpiresAt &&
+        new Date(user.temporaryPasswordExpiresAt) < new Date()
+      ) {
+        await recordAuditLog({
+          actorId: user.id,
+          action: 'AUTH_TEMP_PASSWORD_EXPIRED',
+          entityType: 'USER',
+          entityId: user.id,
+          ipAddress: req.ip,
+        });
+        return sendError(
+          reply,
+          401,
+          'TEMPORARY_PASSWORD_EXPIRED',
+          'Password sementara Anda telah kedaluwarsa. Hubungi administrator untuk melakukan reset ulang.'
+        );
+      }
+
       const rawSessionToken = generateRandomToken(32);
       const tokenHash = hashSessionToken(rawSessionToken);
       const csrfToken = generateRandomToken(24);
@@ -198,12 +234,20 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
         ipAddress: req.ip,
       });
 
-      setSessionCookies(reply, rawSessionToken, csrfToken, expiresAt);
+      setSessionCookies(req, reply, rawSessionToken, csrfToken, expiresAt);
+
+      const unreadNotifications = await db
+        .select()
+        .from(notifications)
+        .where(eq(notifications.userId, user.id))
+        .orderBy(desc(notifications.createdAt))
+        .limit(15);
 
       const profile = await getUserWithRolesAndPermissions(user.id);
       return sendSuccess(reply, {
         user: profile,
         csrfToken,
+        notifications: unreadNotifications,
       });
     } catch (error) {
       console.error('Login error:', error);
@@ -251,12 +295,20 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
         ipAddress: req.ip,
       });
 
-      setSessionCookies(reply, rawSessionToken, csrfToken, expiresAt);
+      setSessionCookies(req, reply, rawSessionToken, csrfToken, expiresAt);
+      const unreadNotifications = await db
+        .select()
+        .from(notifications)
+        .where(eq(notifications.userId, user.id))
+        .orderBy(desc(notifications.createdAt))
+        .limit(15);
+
       const profile = await getUserWithRolesAndPermissions(user.id);
 
       return sendSuccess(reply, {
         user: profile,
         csrfToken,
+        notifications: unreadNotifications,
       });
     } catch (error) {
       console.error('Google Sign-In verification error:', error);
@@ -284,8 +336,12 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
         studyProgram: user.studyProgram,
         roles: user.roles,
         permissions: user.permissions,
+        mustResetPassword: user.mustResetPassword,
+        temporaryPasswordExpiresAt: user.temporaryPasswordExpiresAt,
+        passwordChangedAt: user.passwordChangedAt,
       },
       csrfToken: user.csrfToken,
+      impersonation: user.impersonation || null,
       notifications: unreadNotifications,
     });
   });
@@ -294,16 +350,594 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
     const rawToken = req.cookies?.[SESSION_COOKIE_NAME];
     if (rawToken) {
       const tokenHash = hashSessionToken(rawToken);
+      const sessionRows = await db
+        .select({ id: userSessions.id })
+        .from(userSessions)
+        .where(eq(userSessions.tokenHash, tokenHash));
+      const sessionRow = sessionRows[0];
+      if (sessionRow) {
+        const now = new Date();
+        const activeImpRows = await db
+          .select()
+          .from(impersonationSessions)
+          .where(
+            and(
+              eq(impersonationSessions.sessionId, sessionRow.id),
+              eq(impersonationSessions.isActive, true)
+            )
+          );
+        const activeImp = activeImpRows[0];
+        if (activeImp) {
+          await db
+            .update(impersonationSessions)
+            .set({ isActive: false, endedAt: now, endReason: 'LOGOUT' })
+            .where(eq(impersonationSessions.id, activeImp.id));
+
+          void recordAuditLog({
+            actorId: activeImp.originalUserId,
+            action: 'USER_IMPERSONATION_ENDED',
+            entityType: 'USER_IMPERSONATION',
+            entityId: activeImp.impersonatedUserId,
+            metadata: {
+              impersonationSessionId: activeImp.id,
+              sessionId: sessionRow.id,
+              originalUserId: activeImp.originalUserId,
+              impersonatedUserId: activeImp.impersonatedUserId,
+              originalRole: activeImp.originalRole,
+              impersonatedRole: activeImp.impersonatedRole,
+              endReason: 'LOGOUT',
+              userAgent: req.headers['user-agent'] || null,
+            },
+            ipAddress: req.ip,
+          });
+        }
+      }
+
       await db
         .update(userSessions)
         .set({ isRevoked: true })
         .where(eq(userSessions.tokenHash, tokenHash));
     }
 
-    reply.clearCookie(SESSION_COOKIE_NAME, { path: '/' });
-    reply.clearCookie(CSRF_COOKIE_NAME, { path: '/' });
+    const isHttps = req.protocol === 'https' || req.headers?.['x-forwarded-proto'] === 'https';
+    const secure = isProd && isHttps;
+
+    reply.clearCookie(SESSION_COOKIE_NAME, {
+      path: '/',
+      httpOnly: true,
+      secure,
+      sameSite: secure ? 'none' : 'lax',
+    });
+    reply.clearCookie(CSRF_COOKIE_NAME, {
+      path: '/',
+      httpOnly: false,
+      secure,
+      sameSite: secure ? 'none' : 'lax',
+    });
 
     return sendSuccess(reply, { loggedOut: true });
+  });
+
+  // ============================================================================
+  // ACCOUNT SWITCHING / USER IMPERSONATION
+  // ============================================================================
+  const startImpersonationSchema = z.object({
+    targetUserId: z.string().uuid('ID pengguna tujuan tidak valid.'),
+    reason: z.string().trim().max(500).optional(),
+  });
+
+  fastify.post('/api/v1/auth/impersonation/start', async (req, reply) => {
+    const actor = await authenticateRequest(req, reply, {
+      requiredPermissions: ['users.impersonate'],
+    });
+    if (!actor) return;
+
+    // 1. Block nested impersonation
+    if (actor.impersonation?.isImpersonating) {
+      void recordAuditLog({
+        actorId: actor.impersonation.originalUserId,
+        action: 'USER_IMPERSONATION_FAILED',
+        entityType: 'USER_IMPERSONATION',
+        entityId: actor.id,
+        metadata: {
+          reasonCode: 'NESTED_IMPERSONATION_FORBIDDEN',
+          originalUserId: actor.impersonation.originalUserId,
+          currentImpersonatedUserId: actor.id,
+          userAgent: req.headers['user-agent'] || null,
+        },
+        ipAddress: req.ip,
+      });
+      return sendError(
+        reply,
+        403,
+        'NESTED_IMPERSONATION_FORBIDDEN',
+        'Impersonasi bertingkat tidak diizinkan. Kembali ke akun Superadmin terlebih dahulu.'
+      );
+    }
+
+    // 2. Enforce Superadmin-only impersonation
+    const isActorSuperadmin = actor.roles.some((r) => r.toUpperCase() === 'SUPERADMIN');
+    if (!isActorSuperadmin) {
+      void recordAuditLog({
+        actorId: actor.id,
+        action: 'USER_IMPERSONATION_FAILED',
+        entityType: 'USER_IMPERSONATION',
+        metadata: {
+          reasonCode: 'FORBIDDEN_SUPERADMIN_ONLY',
+          userAgent: req.headers['user-agent'] || null,
+        },
+        ipAddress: req.ip,
+      });
+      return sendError(
+        reply,
+        403,
+        'FORBIDDEN_INSUFFICIENT_PERMISSIONS',
+        'Hanya Superadmin yang diizinkan melakukan perpindahan akun (Switch Account).'
+      );
+    }
+
+    if (!actor.sessionId) {
+      return sendError(
+        reply,
+        400,
+        'SESSION_REQUIRED',
+        'Switch Account hanya tersedia untuk sesi cookie server.'
+      );
+    }
+
+    const parsed = startImpersonationSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return sendError(
+        reply,
+        400,
+        'VALIDATION_ERROR',
+        'Data permintaan Switch Account tidak valid.',
+        parsed.error.issues
+      );
+    }
+
+    const { targetUserId, reason } = parsed.data;
+
+    if (targetUserId === actor.id) {
+      return sendError(
+        reply,
+        400,
+        'CANNOT_IMPERSONATE_SELF',
+        'Anda sudah masuk menggunakan akun ini.'
+      );
+    }
+
+    // 3. Validate target user exists, is active, and is not a Superadmin
+    const [targetRow] = await db.select().from(users).where(eq(users.id, targetUserId));
+    if (!targetRow) {
+      void recordAuditLog({
+        actorId: actor.id,
+        action: 'USER_IMPERSONATION_FAILED',
+        entityType: 'USER_IMPERSONATION',
+        entityId: targetUserId,
+        metadata: {
+          reasonCode: 'USER_NOT_FOUND',
+          targetUserId,
+          userAgent: req.headers['user-agent'] || null,
+        },
+        ipAddress: req.ip,
+      });
+      return sendError(reply, 404, 'USER_NOT_FOUND', 'Akun pengguna tujuan tidak ditemukan.');
+    }
+
+    if (!targetRow.isActive || targetRow.accountStatus !== 'ACTIVE') {
+      void recordAuditLog({
+        actorId: actor.id,
+        action: 'USER_IMPERSONATION_FAILED',
+        entityType: 'USER_IMPERSONATION',
+        entityId: targetUserId,
+        metadata: {
+          reasonCode: 'TARGET_USER_INACTIVE',
+          targetUserId,
+          accountStatus: targetRow.accountStatus,
+          isActive: targetRow.isActive,
+          userAgent: req.headers['user-agent'] || null,
+        },
+        ipAddress: req.ip,
+      });
+      return sendError(
+        reply,
+        400,
+        'TARGET_USER_INACTIVE',
+        'Akun tujuan berstatus nonaktif atau terkunci dan tidak dapat diakses.'
+      );
+    }
+
+    const targetProfile = await getUserWithRolesAndPermissions(targetUserId);
+    if (!targetProfile) {
+      return sendError(reply, 404, 'USER_NOT_FOUND', 'Profil pengguna tujuan tidak ditemukan.');
+    }
+
+    if (targetProfile.roles.some((r) => r.toUpperCase() === 'SUPERADMIN')) {
+      void recordAuditLog({
+        actorId: actor.id,
+        action: 'USER_IMPERSONATION_FAILED',
+        entityType: 'USER_IMPERSONATION',
+        entityId: targetUserId,
+        metadata: {
+          reasonCode: 'CANNOT_IMPERSONATE_SUPERADMIN',
+          targetUserId,
+          targetRoles: targetProfile.roles,
+          userAgent: req.headers['user-agent'] || null,
+        },
+        ipAddress: req.ip,
+      });
+      return sendError(
+        reply,
+        403,
+        'CANNOT_IMPERSONATE_SUPERADMIN',
+        'Tidak diizinkan melakukan Switch Account ke akun Superadmin lain.'
+      );
+    }
+
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 60 * 60 * 1000); // 1 hour limit
+    const originalRole = actor.roles[0] || 'SUPERADMIN';
+    const impersonatedRole = targetProfile.roles[0] || 'MAHASISWA';
+
+    // Deactivate any stale impersonation rows on this session just in case
+    await db
+      .update(impersonationSessions)
+      .set({ isActive: false, endedAt: now, endReason: 'REPLACED' })
+      .where(
+        and(
+          eq(impersonationSessions.sessionId, actor.sessionId),
+          eq(impersonationSessions.isActive, true)
+        )
+      );
+
+    const [createdImp] = await db
+      .insert(impersonationSessions)
+      .values({
+        sessionId: actor.sessionId,
+        originalUserId: actor.id,
+        impersonatedUserId: targetProfile.id,
+        originalRole,
+        impersonatedRole,
+        reason: reason || 'Troubleshooting & Dukungan Akademik',
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'] || null,
+        isActive: true,
+        startedAt: now,
+        expiresAt,
+      })
+      .returning();
+
+    await recordAuditLog({
+      actorId: actor.id,
+      action: 'USER_IMPERSONATION_STARTED',
+      entityType: 'USER_IMPERSONATION',
+      entityId: targetProfile.id,
+      metadata: {
+        impersonationSessionId: createdImp.id,
+        sessionId: actor.sessionId,
+        originalUserId: actor.id,
+        impersonatedUserId: targetProfile.id,
+        originalRole,
+        impersonatedRole,
+        reason: createdImp.reason,
+        expiresAt: expiresAt.toISOString(),
+        userAgent: req.headers['user-agent'] || null,
+      },
+      ipAddress: req.ip,
+    });
+
+    return sendSuccess(reply, {
+      user: {
+        id: targetProfile.id,
+        email: targetProfile.email,
+        fullName: targetProfile.fullName,
+        identityNumber: targetProfile.identityNumber,
+        studyProgram: targetProfile.studyProgram,
+        roles: targetProfile.roles,
+        permissions: targetProfile.permissions,
+        mustResetPassword: targetProfile.mustResetPassword,
+        temporaryPasswordExpiresAt: targetProfile.temporaryPasswordExpiresAt,
+        passwordChangedAt: targetProfile.passwordChangedAt,
+      },
+      csrfToken: actor.csrfToken,
+      impersonation: {
+        isImpersonating: true,
+        impersonationSessionId: createdImp.id,
+        originalUserId: actor.id,
+        originalUserName: actor.fullName,
+        originalUserEmail: actor.email,
+        originalRole,
+        impersonatedUserId: targetProfile.id,
+        impersonatedUserName: targetProfile.fullName,
+        impersonatedRole,
+        startedAt: createdImp.startedAt.toISOString(),
+        expiresAt: createdImp.expiresAt.toISOString(),
+        reason: createdImp.reason,
+      },
+    });
+  });
+
+  fastify.post('/api/v1/auth/impersonation/stop', async (req, reply) => {
+    const actor = await authenticateRequest(req, reply);
+    if (!actor) return;
+
+    if (!actor.impersonation?.isImpersonating || !actor.sessionId) {
+      return sendError(
+        reply,
+        400,
+        'NOT_IMPERSONATING',
+        'Tidak ada sesi Switch Account yang sedang aktif.'
+      );
+    }
+
+    const imp = actor.impersonation;
+    const origProfile = await getUserWithRolesAndPermissions(imp.originalUserId);
+    if (!origProfile) {
+      return sendError(
+        reply,
+        403,
+        'ORIGINAL_USER_UNAVAILABLE',
+        'Akun Superadmin asli tidak tersedia atau nonaktif.'
+      );
+    }
+
+    const hasStopPerm =
+      origProfile.roles.some((r) => r.toUpperCase() === 'SUPERADMIN') ||
+      origProfile.permissions.includes('users.impersonate.stop');
+    if (!hasStopPerm) {
+      return sendError(
+        reply,
+        403,
+        'FORBIDDEN_INSUFFICIENT_PERMISSIONS',
+        'Akun asli tidak memiliki izin untuk mengakhiri sesi impersonasi.'
+      );
+    }
+
+    const now = new Date();
+    await db
+      .update(impersonationSessions)
+      .set({
+        isActive: false,
+        endedAt: now,
+        endReason: 'MANUAL_STOP',
+      })
+      .where(eq(impersonationSessions.id, imp.impersonationSessionId));
+
+    await recordAuditLog({
+      actorId: origProfile.id,
+      action: 'USER_IMPERSONATION_ENDED',
+      entityType: 'USER_IMPERSONATION',
+      entityId: imp.impersonatedUserId,
+      metadata: {
+        impersonationSessionId: imp.impersonationSessionId,
+        sessionId: actor.sessionId,
+        originalUserId: origProfile.id,
+        impersonatedUserId: imp.impersonatedUserId,
+        originalRole: imp.originalRole,
+        impersonatedRole: imp.impersonatedRole,
+        endReason: 'MANUAL_STOP',
+        reason: imp.reason,
+        userAgent: req.headers['user-agent'] || null,
+      },
+      ipAddress: req.ip,
+    });
+
+    return sendSuccess(reply, {
+      user: {
+        id: origProfile.id,
+        email: origProfile.email,
+        fullName: origProfile.fullName,
+        identityNumber: origProfile.identityNumber,
+        studyProgram: origProfile.studyProgram,
+        roles: origProfile.roles,
+        permissions: origProfile.permissions,
+        mustResetPassword: origProfile.mustResetPassword,
+        temporaryPasswordExpiresAt: origProfile.temporaryPasswordExpiresAt,
+        passwordChangedAt: origProfile.passwordChangedAt,
+      },
+      csrfToken: actor.csrfToken,
+      impersonation: null,
+    });
+  });
+
+  fastify.get('/api/v1/auth/impersonation/status', async (req, reply) => {
+    const actor = await authenticateRequest(req, reply, { requireCsrf: false });
+    if (!actor) return;
+
+    const imp = actor.impersonation || null;
+    return sendSuccess(reply, {
+      isImpersonating: Boolean(imp?.isImpersonating),
+      originalUser: imp
+        ? {
+            id: imp.originalUserId,
+            name: imp.originalUserName,
+            email: imp.originalUserEmail,
+            role: imp.originalRole,
+          }
+        : null,
+      effectiveUser: {
+        id: actor.id,
+        name: actor.fullName,
+        email: actor.email,
+        role: actor.roles[0] || 'MAHASISWA',
+      },
+      impersonation: imp,
+    });
+  });
+
+  const changePasswordSchema = z.object({
+    currentPassword: z.string().min(1, 'Password saat ini wajib diisi.'),
+    newPassword: z.string().min(12, 'Password baru minimal 12 karakter.'),
+    confirmPassword: z.string().min(1, 'Konfirmasi password baru wajib diisi.'),
+  });
+
+  fastify.post('/api/v1/auth/change-password', async (req, reply) => {
+    const actor = await authenticateRequest(req, reply);
+    if (!actor) return;
+
+    const parsed = changePasswordSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return sendError(
+        reply,
+        400,
+        'VALIDATION_ERROR',
+        parsed.error.issues[0]?.message || 'Input perubahan password tidak valid.',
+        parsed.error.issues
+      );
+    }
+
+    const { currentPassword, newPassword, confirmPassword } = parsed.data;
+    if (newPassword !== confirmPassword) {
+      return sendError(
+        reply,
+        400,
+        'PASSWORD_MISMATCH',
+        'Konfirmasi password baru tidak sesuai.'
+      );
+    }
+
+    const userRows = await db.select().from(users).where(eq(users.id, actor.id));
+    const dbUser = userRows[0];
+    if (!dbUser) {
+      return sendError(reply, 404, 'USER_NOT_FOUND', 'Akun pengguna tidak ditemukan.');
+    }
+
+    const validCurrent = await verifyPassword(dbUser.passwordHash, currentPassword);
+    if (!validCurrent) {
+      await recordAuditLog({
+        actorId: actor.id,
+        action: 'AUTH_PASSWORD_CHANGE_FAILED',
+        entityType: 'USER',
+        entityId: actor.id,
+        metadata: { reason: 'INVALID_CURRENT_PASSWORD' },
+        ipAddress: req.ip,
+      });
+      return sendError(
+        reply,
+        400,
+        'INVALID_CURRENT_PASSWORD',
+        'Password saat ini tidak sesuai.'
+      );
+    }
+
+    const profileRows = await db
+      .select()
+      .from(userProfiles)
+      .where(eq(userProfiles.userId, actor.id));
+    const profile = profileRows[0];
+
+    const policyCheck = validatePasswordPolicy(newPassword, {
+      identityValues: [
+        dbUser.identityNumber,
+        profile?.nim,
+        profile?.nidn,
+        profile?.nip,
+      ],
+    });
+    if (!policyCheck.valid) {
+      await recordAuditLog({
+        actorId: actor.id,
+        action: 'AUTH_PASSWORD_CHANGE_FAILED',
+        entityType: 'USER',
+        entityId: actor.id,
+        metadata: { reason: 'POLICY_VIOLATION' },
+        ipAddress: req.ip,
+      });
+      return sendError(
+        reply,
+        400,
+        'WEAK_PASSWORD',
+        policyCheck.errors[0] || 'Password baru tidak memenuhi kebijakan keamanan.',
+        policyCheck.errors
+      );
+    }
+
+    const reused = await checkPasswordReuse(actor.id, newPassword, dbUser.passwordHash);
+    if (reused) {
+      await recordAuditLog({
+        actorId: actor.id,
+        action: 'AUTH_PASSWORD_CHANGE_FAILED',
+        entityType: 'USER',
+        entityId: actor.id,
+        metadata: { reason: 'PASSWORD_REUSE_FORBIDDEN' },
+        ipAddress: req.ip,
+      });
+      return sendError(
+        reply,
+        400,
+        'PASSWORD_REUSE_FORBIDDEN',
+        'Password baru tidak boleh sama dengan 5 password terakhir Anda.'
+      );
+    }
+
+    const newHash = await hashPassword(newPassword);
+    const now = new Date();
+    const rawSessionToken = generateRandomToken(32);
+    const tokenHash = hashSessionToken(rawSessionToken);
+    const newCsrfToken = generateRandomToken(24);
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+    await db.transaction(async (tx) => {
+      await recordPasswordInHistory(tx, actor.id, dbUser.passwordHash);
+
+      await tx
+        .update(users)
+        .set({
+          passwordHash: newHash,
+          mustResetPassword: false,
+          temporaryPasswordExpiresAt: null,
+          passwordChangedAt: now,
+          accountStatus: 'ACTIVE',
+          isActive: true,
+          updatedAt: now,
+        })
+        .where(eq(users.id, actor.id));
+
+      await tx
+        .update(userSessions)
+        .set({ isRevoked: true })
+        .where(eq(userSessions.userId, actor.id));
+
+      await tx.insert(userSessions).values({
+        userId: actor.id,
+        tokenHash,
+        csrfToken: newCsrfToken,
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'] || 'Unknown',
+        expiresAt,
+      });
+
+      await tx.insert(notifications).values({
+        userId: actor.id,
+        title: 'Password Anda Berhasil Diperbarui',
+        message:
+          'Kata sandi akun Politeknik Kampar LMS Anda telah berhasil diperbarui dan seluruh sesi sebelumnya telah dicabut.',
+        type: 'SECURITY',
+      });
+    });
+
+    await recordAuditLog({
+      actorId: actor.id,
+      action: 'AUTH_PASSWORD_CHANGED',
+      entityType: 'USER',
+      entityId: actor.id,
+      metadata: {
+        sessionsRevoked: true,
+        newSessionIssued: true,
+        result: 'SUCCESS',
+      },
+      ipAddress: req.ip,
+    });
+
+    setSessionCookies(req, reply, rawSessionToken, newCsrfToken, expiresAt);
+    const updatedProfile = await getUserWithRolesAndPermissions(actor.id);
+
+    return sendSuccess(reply, {
+      user: updatedProfile,
+      csrfToken: newCsrfToken,
+      passwordChanged: true,
+    });
   });
 
   // Mark notifications as read
@@ -320,218 +954,18 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
   });
 
   // ============================================================================
-  // 2. SUPERADMIN: USERS, RBAC ROLES & PERMISSIONS, ACADEMIC DATA, AUDIT LOGS
+  // 2. RBAC ROLES & PERMISSIONS, ACADEMIC DATA, AUDIT LOGS
+  // (User Administration endpoints are registered in userManagementRoutes.ts)
   // ============================================================================
-  fastify.get('/api/v1/users', async (req, reply) => {
-    const user = await authenticateRequest(req, reply, {
-      requiredPermissions: ['users:read'],
-    });
-    if (!user) return;
 
-    const query = req.query as { page?: string; limit?: string; search?: string; role?: string };
-    const page = Math.max(1, parseInt(query.page || '1', 10));
-    const limit = Math.min(50, Math.max(1, parseInt(query.limit || '10', 10)));
-    const search = (query.search || '').trim();
-    const roleFilter = (query.role || '').trim();
-
-    const allUsers = await db.select().from(users).orderBy(asc(users.fullName));
-    const allProfiles = await db.select().from(userProfiles);
-    const allUserRoles = await db
-      .select({
-        userId: userRoles.userId,
-        roleCode: roles.code,
-        roleName: roles.name,
-      })
-      .from(userRoles)
-      .innerJoin(roles, eq(userRoles.roleId, roles.id));
-
-    const profileMap = new Map(allProfiles.map((p) => [p.userId, p]));
-
-    const enriched = allUsers
-      .map((u) => {
-        const uRoles = allUserRoles
-          .filter((ur) => ur.userId === u.id)
-          .map((ur) => ur.roleCode);
-        const prof = profileMap.get(u.id);
-        return {
-          id: u.id,
-          email: u.email,
-          fullName: u.fullName,
-          identityNumber: u.identityNumber,
-          isActive: u.isActive,
-          lastLoginAt: u.lastLoginAt,
-          createdAt: u.createdAt,
-          studyProgram: prof?.studyProgram || 'Teknik Informatika',
-          academicTitle: prof?.academicTitle || null,
-          semesterLevel: prof?.semesterLevel || null,
-          roles: uRoles,
-        };
-      })
-      .filter((u) => {
-        if (roleFilter && !u.roles.includes(roleFilter)) return false;
-        if (search) {
-          const q = search.toLowerCase();
-          return (
-            u.fullName.toLowerCase().includes(q) ||
-            u.email.toLowerCase().includes(q) ||
-            (u.identityNumber || '').toLowerCase().includes(q) ||
-            u.studyProgram.toLowerCase().includes(q)
-          );
-        }
-        return true;
-      });
-
-    const total = enriched.length;
-    const paginated = enriched.slice((page - 1) * limit, page * limit);
-
-    return sendSuccess(reply, paginated, {
-      page,
-      limit,
-      total,
-      totalPages: Math.max(1, Math.ceil(total / limit)),
-    });
-  });
-
-  const createUserSchema = z.object({
-    email: z.string().email(),
-    fullName: z.string().min(3),
-    identityNumber: z.string().min(3),
-    password: z.string().min(8),
-    roleCode: z.enum(['SUPERADMIN', 'DOSEN', 'MAHASISWA']),
-    studyProgram: z.string().min(2),
-  });
-
-  fastify.post('/api/v1/users', async (req, reply) => {
-    const actor = await authenticateRequest(req, reply, {
-      requiredPermissions: ['users:manage'],
-    });
-    if (!actor) return;
-
-    const parsed = createUserSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return sendError(
-        reply,
-        400,
-        'VALIDATION_ERROR',
-        'Data pengguna baru tidak lengkap atau tidak valid.',
-        parsed.error.issues
-      );
-    }
-
-    const { email, fullName, identityNumber, password, roleCode, studyProgram } =
-      parsed.data;
-
-    try {
-      const passwordHash = await hashPassword(password);
-      const created = await db.transaction(async (tx) => {
-        const [newUser] = await tx
-          .insert(users)
-          .values({
-            email: email.toLowerCase(),
-            fullName,
-            identityNumber,
-            passwordHash,
-            isActive: true,
-          })
-          .returning();
-
-        await tx.insert(userProfiles).values({
-          userId: newUser.id,
-          studyProgram,
-          semesterLevel: roleCode === 'MAHASISWA' ? 1 : null,
-        });
-
-        const roleRow = await tx
-          .select()
-          .from(roles)
-          .where(eq(roles.code, roleCode));
-        if (roleRow[0]) {
-          await tx.insert(userRoles).values({
-            userId: newUser.id,
-            roleId: roleRow[0].id,
-          });
-        }
-
-        return newUser;
-      });
-
-      await recordAuditLog({
-        actorId: actor.id,
-        action: 'USER_CREATED',
-        entityType: 'USER',
-        entityId: created.id,
-        metadata: { email: created.email, roleCode, identityNumber },
-        ipAddress: req.ip,
-      });
-
-      return sendSuccess(
-        reply,
-        {
-          id: created.id,
-          email: created.email,
-          fullName: created.fullName,
-          identityNumber: created.identityNumber,
-          roleCode,
-        },
-        null,
-        201
-      );
-    } catch (error: any) {
-      console.error('Create user failed:', error);
-      return sendError(
-        reply,
-        409,
-        'USER_CONFLICT',
-        'Email atau Nomor Identitas (NIM/NIDN/NIP) sudah terdaftar.'
-      );
-    }
-  });
-
-  fastify.patch('/api/v1/users/:userId/status', async (req, reply) => {
-    const actor = await authenticateRequest(req, reply, {
-      requiredPermissions: ['users:manage'],
-    });
-    if (!actor) return;
-
-    const { userId } = req.params as { userId: string };
-    const bodySchema = z.object({ isActive: z.boolean() });
-    const parsed = bodySchema.safeParse(req.body);
-    if (!parsed.success) {
-      return sendError(reply, 400, 'VALIDATION_ERROR', 'Status aktif tidak valid.');
-    }
-
-    if (userId === actor.id && !parsed.data.isActive) {
-      return sendError(
-        reply,
-        400,
-        'SELF_DEACTIVATION_FORBIDDEN',
-        'Anda tidak dapat menonaktifkan akun Superadmin Anda sendiri.'
-      );
-    }
-
-    const [updated] = await db
-      .update(users)
-      .set({ isActive: parsed.data.isActive, updatedAt: new Date() })
-      .where(eq(users.id, userId))
-      .returning();
-
-    await recordAuditLog({
-      actorId: actor.id,
-      action: parsed.data.isActive ? 'USER_ACTIVATED' : 'USER_DEACTIVATED',
-      entityType: 'USER',
-      entityId: userId,
-      ipAddress: req.ip,
-    });
-
-    return sendSuccess(reply, updated);
-  });
-
-  // RBAC Roles & Permissions Matrix
+  // RBAC Roles & Permissions Matrix (Academic Access Control Center)
   fastify.get('/api/v1/rbac/roles', async (req, reply) => {
     const actor = await authenticateRequest(req, reply, {
-      requiredPermissions: ['rbac:manage'],
+      anyPermissions: ['rbac:view', 'rbac:manage'],
     });
     if (!actor) return;
+
+    await ensureRbacInitialized();
 
     const allRoles = await db.select().from(roles).orderBy(asc(roles.code));
     const allPerms = await db
@@ -539,17 +973,92 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
       .from(permissions)
       .orderBy(asc(permissions.module), asc(permissions.code));
     const allRolePerms = await db.select().from(rolePermissions);
+    const allUserRoles = await db.select().from(userRoles);
+    const allUsersCount = (await db.select({ id: users.id }).from(users)).length;
 
-    const roleMatrix = allRoles.map((r) => ({
-      ...r,
-      permissionIds: allRolePerms
-        .filter((rp) => rp.roleId === r.id)
-        .map((rp) => rp.permissionId),
-    }));
+    const rbacAuditRows = await db
+      .select({
+        id: auditLogs.id,
+        actorId: auditLogs.actorId,
+        action: auditLogs.action,
+        entityType: auditLogs.entityType,
+        entityId: auditLogs.entityId,
+        metadata: auditLogs.metadata,
+        createdAt: auditLogs.createdAt,
+        actorName: users.fullName,
+        actorEmail: users.email,
+      })
+      .from(auditLogs)
+      .leftJoin(users, eq(auditLogs.actorId, users.id))
+      .where(ilike(auditLogs.action, 'RBAC_PERMISSION_%'))
+      .orderBy(desc(auditLogs.createdAt))
+      .limit(50);
+
+    const roleScopeMap: Record<string, string> = {
+      SUPERADMIN: 'GLOBAL',
+      DOSEN: 'ASSIGNED & OWN',
+      MAHASISWA: 'ENROLLED & OWN',
+      AUDITOR: 'INSTITUTION (READ-ONLY)',
+    };
+
+    const roleMatrix = allRoles.map((r) => {
+      const rolePerms = allRolePerms.filter((rp) => rp.roleId === r.id);
+      const userCount = allUserRoles.filter((ur) => ur.roleId === r.id).length;
+      const latestChange = rbacAuditRows.find((a) => a.entityId === r.id);
+      const latestAssigned = rolePerms.reduce<Date | null>((acc, rp) => {
+        if (!acc || rp.assignedAt > acc) return rp.assignedAt;
+        return acc;
+      }, null);
+
+      return {
+        ...r,
+        userCount,
+        accessScope: roleScopeMap[r.code.toUpperCase()] || 'CUSTOM',
+        status: 'ACTIVE',
+        lastModified: latestChange?.createdAt || latestAssigned || r.createdAt,
+        permissionIds: rolePerms.map((rp) => rp.permissionId),
+      };
+    });
+
+    const enrichedPermissions = allPerms.map((p) => {
+      const def = PERMISSION_MAP_BY_CODE.get(p.code);
+      return {
+        ...p,
+        name: def?.name || p.code,
+        actionType: def?.actionType || 'MANAGE',
+        riskLevel: def?.riskLevel || 'MEDIUM',
+        allowedContext: def?.allowedContext || ['GLOBAL'],
+        isProtected: def?.isProtected ?? false,
+        auditorAllowed: def?.auditorAllowed ?? false,
+      };
+    });
 
     return sendSuccess(reply, {
       roles: roleMatrix,
-      permissions: allPerms,
+      permissions: enrichedPermissions,
+      stats: {
+        totalRoles: allRoles.length,
+        totalPermissions: enrichedPermissions.length,
+        totalUsers: allUsersCount,
+        recentChangesCount: rbacAuditRows.length,
+      },
+      history: rbacAuditRows.map((row) => {
+        const meta = (row.metadata || {}) as Record<string, unknown>;
+        return {
+          id: row.id,
+          timestamp: row.createdAt,
+          actorName: row.actorName || 'Sistem',
+          actorEmail: row.actorEmail || null,
+          action: row.action,
+          roleId: row.entityId,
+          roleCode: (meta.roleCode as string) || 'UNKNOWN',
+          permissionCode: (meta.permissionCode as string) || (meta.permissionId as string) || '—',
+          previousValue: meta.previousValue ?? !meta.enabled,
+          newValue: meta.newValue ?? Boolean(meta.enabled),
+          reason: (meta.reason as string) || 'Pembaruan matriks otorisasi RBAC',
+          result: (meta.result as string) || 'SUCCESS',
+        };
+      }),
     });
   });
 
@@ -557,6 +1066,7 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
     roleId: z.string().uuid(),
     permissionId: z.string().uuid(),
     enabled: z.boolean(),
+    reason: z.string().trim().max(300).optional(),
   });
 
   fastify.post('/api/v1/rbac/roles/permissions', async (req, reply) => {
@@ -570,7 +1080,50 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
       return sendError(reply, 400, 'VALIDATION_ERROR', 'Payload izin RBAC tidak valid.');
     }
 
-    const { roleId, permissionId, enabled } = parsed.data;
+    const { roleId, permissionId, enabled, reason } = parsed.data;
+    const [targetRole] = await db.select().from(roles).where(eq(roles.id, roleId));
+    const [targetPerm] = await db
+      .select()
+      .from(permissions)
+      .where(eq(permissions.id, permissionId));
+
+    if (!targetRole || !targetPerm) {
+      return sendError(reply, 404, 'NOT_FOUND', 'Peran atau izin tidak ditemukan.');
+    }
+
+    const upperRole = targetRole.code.toUpperCase();
+    const permDef = PERMISSION_MAP_BY_CODE.get(targetPerm.code);
+
+    // Protected SUPERADMIN rule
+    if (upperRole === 'SUPERADMIN' && !enabled) {
+      return sendError(
+        reply,
+        403,
+        'FORBIDDEN_PROTECTED_SUPERADMIN_PERMISSION',
+        'Izin esensial SUPERADMIN dilindungi sistem dan tidak dapat dinonaktifkan.'
+      );
+    }
+
+    // Strict AUDITOR read-only rule
+    if (upperRole === 'AUDITOR' && enabled && !permDef?.auditorAllowed) {
+      return sendError(
+        reply,
+        403,
+        'FORBIDDEN_AUDITOR_READ_ONLY',
+        'Peran AUDITOR bersifat hanya-baca (read-only) dan tidak dapat diberikan izin mutasi atau ekspor.'
+      );
+    }
+
+    const existing = await db
+      .select()
+      .from(rolePermissions)
+      .where(
+        and(
+          eq(rolePermissions.roleId, roleId),
+          eq(rolePermissions.permissionId, permissionId)
+        )
+      );
+    const previousValue = existing.length > 0;
 
     if (enabled) {
       await db
@@ -593,11 +1146,104 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
       action: enabled ? 'RBAC_PERMISSION_GRANTED' : 'RBAC_PERMISSION_REVOKED',
       entityType: 'ROLE_PERMISSION',
       entityId: roleId,
-      metadata: { permissionId, enabled },
+      metadata: {
+        roleCode: targetRole.code,
+        permissionId,
+        permissionCode: targetPerm.code,
+        previousValue,
+        newValue: enabled,
+        enabled,
+        reason: reason || 'Perubahan izin melalui Academic Access Control Center',
+        result: 'SUCCESS',
+      },
       ipAddress: req.ip,
     });
 
     return sendSuccess(reply, { roleId, permissionId, enabled });
+  });
+
+  const bulkPermissionSchema = z.object({
+    roleId: z.string().uuid(),
+    permissionIds: z.array(z.string().uuid()),
+    enabled: z.boolean(),
+    reason: z.string().trim().max(300).optional(),
+  });
+
+  fastify.post('/api/v1/rbac/roles/permissions/bulk', async (req, reply) => {
+    const actor = await authenticateRequest(req, reply, {
+      requiredPermissions: ['rbac:manage'],
+    });
+    if (!actor) return;
+
+    const parsed = bulkPermissionSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return sendError(reply, 400, 'VALIDATION_ERROR', 'Payload pembaruan massal RBAC tidak valid.');
+    }
+
+    const { roleId, permissionIds, enabled, reason } = parsed.data;
+    const [targetRole] = await db.select().from(roles).where(eq(roles.id, roleId));
+    if (!targetRole) {
+      return sendError(reply, 404, 'NOT_FOUND', 'Peran tidak ditemukan.');
+    }
+
+    const upperRole = targetRole.code.toUpperCase();
+    if (upperRole === 'SUPERADMIN' && !enabled) {
+      return sendError(
+        reply,
+        403,
+        'FORBIDDEN_PROTECTED_SUPERADMIN_PERMISSION',
+        'Izin SUPERADMIN dilindungi sistem dan tidak dapat dinonaktifkan.'
+      );
+    }
+
+    const allPerms = await db.select().from(permissions);
+    const permById = new Map(allPerms.map((p) => [p.id, p]));
+    const changedCodes: string[] = [];
+
+    for (const permissionId of permissionIds) {
+      const targetPerm = permById.get(permissionId);
+      if (!targetPerm) continue;
+      const permDef = PERMISSION_MAP_BY_CODE.get(targetPerm.code);
+      if (upperRole === 'AUDITOR' && enabled && !permDef?.auditorAllowed) {
+        continue;
+      }
+
+      if (enabled) {
+        await db
+          .insert(rolePermissions)
+          .values({ roleId, permissionId })
+          .onConflictDoNothing();
+      } else {
+        await db
+          .delete(rolePermissions)
+          .where(
+            and(
+              eq(rolePermissions.roleId, roleId),
+              eq(rolePermissions.permissionId, permissionId)
+            )
+          );
+      }
+      changedCodes.push(targetPerm.code);
+    }
+
+    await recordAuditLog({
+      actorId: actor.id,
+      action: enabled ? 'RBAC_PERMISSION_BULK_GRANTED' : 'RBAC_PERMISSION_BULK_REVOKED',
+      entityType: 'ROLE_PERMISSION',
+      entityId: roleId,
+      metadata: {
+        roleCode: targetRole.code,
+        permissionCode: changedCodes.join(', '),
+        count: changedCodes.length,
+        previousValue: !enabled,
+        newValue: enabled,
+        reason: reason || 'Pembaruan modul massal melalui Academic Access Control Center',
+        result: 'SUCCESS',
+      },
+      ipAddress: req.ip,
+    });
+
+    return sendSuccess(reply, { roleId, updatedCount: changedCodes.length, enabled });
   });
 
   // ============================================================================
@@ -634,187 +1280,29 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
     );
   });
 
-  const createCourseSchema = z.object({
-    code: z.string().min(3),
-    title: z.string().min(4),
-    studyProgram: z.string().min(3),
-    credits: z.number().int().min(1).max(8),
-    semesterNumber: z.number().int().min(1).max(8),
-    description: z.string().min(10),
-  });
-
-  fastify.post('/api/v1/academic/courses', async (req, reply) => {
-    const actor = await authenticateRequest(req, reply, {
-      requiredPermissions: ['academic:manage'],
-    });
-    if (!actor) return;
-
-    const parsed = createCourseSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return sendError(
-        reply,
-        400,
-        'VALIDATION_ERROR',
-        'Data mata kuliah tidak valid.',
-        parsed.error.issues
-      );
-    }
-
-    try {
-      const [created] = await db
-        .insert(courses)
-        .values({
-          ...parsed.data,
-          code: parsed.data.code.toUpperCase(),
-          createdById: actor.id,
-        })
-        .returning();
-
-      await recordAuditLog({
-        actorId: actor.id,
-        action: 'COURSE_CREATED',
-        entityType: 'COURSE',
-        entityId: created.id,
-        metadata: { code: created.code, title: created.title },
-        ipAddress: req.ip,
-      });
-
-      return sendSuccess(reply, created, null, 201);
-    } catch (error) {
-      return sendError(
-        reply,
-        409,
-        'COURSE_CODE_CONFLICT',
-        'Kode mata kuliah tersebut sudah digunakan.'
-      );
-    }
-  });
-
   // ============================================================================
-  // 4. CLASSROOMS & ENROLLMENT BUSINESS RULES
+  // 4. CLASSROOMS & ENROLLMENT BUSINESS RULES (INDEPENDENT DIGITAL CLASSROOM)
   // ============================================================================
-  fastify.get('/api/v1/classrooms', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
-    if (!user) return;
-
-    const query = req.query as {
-      page?: string;
-      limit?: string;
-      search?: string;
-      scope?: string;
-    };
-    const page = Math.max(1, parseInt(query.page || '1', 10));
-    const limit = Math.min(50, Math.max(1, parseInt(query.limit || '12', 10)));
-    const search = (query.search || '').trim().toLowerCase();
-    const scope = query.scope || 'all'; // 'all' | 'mine'
-
-    const allClassrooms = await db
-      .select()
-      .from(classrooms)
-      .orderBy(desc(classrooms.createdAt));
-    const allCourses = await db.select().from(courses);
-    const allSemesters = await db.select().from(semesters);
-    const allInstructors = await db
-      .select({
-        classroomId: classroomInstructors.classroomId,
-        instructorId: classroomInstructors.instructorId,
-        isPrimary: classroomInstructors.isPrimary,
-        fullName: users.fullName,
-        email: users.email,
-      })
-      .from(classroomInstructors)
-      .innerJoin(users, eq(classroomInstructors.instructorId, users.id));
-    const allJoinCodes = await db
-      .select()
-      .from(classroomJoinCodes)
-      .where(eq(classroomJoinCodes.isActive, true));
-    const allEnrollments = await db.select().from(classroomEnrollments);
-
-    const courseMap = new Map(allCourses.map((c) => [c.id, c]));
-    const semMap = new Map(allSemesters.map((s) => [s.id, s]));
-
-    const enriched = allClassrooms
-      .map((cls) => {
-        const course = courseMap.get(cls.courseId);
-        const semester = semMap.get(cls.semesterId);
-        const instructors = allInstructors.filter(
-          (i) => i.classroomId === cls.id
-        );
-        const isInstructor = instructors.some(
-          (i) => i.instructorId === user.id
-        );
-        const myEnrollment = allEnrollments.find(
-          (e) => e.classroomId === cls.id && e.studentId === user.id
-        );
-        const activeCount = allEnrollments.filter(
-          (e) => e.classroomId === cls.id && e.status === 'active'
-        ).length;
-        const pendingCount = allEnrollments.filter(
-          (e) => e.classroomId === cls.id && e.status === 'pending'
-        ).length;
-        const activeCode = allJoinCodes.find((jc) => jc.classroomId === cls.id);
-
-        const canManage =
-          user.roles.includes('SUPERADMIN') || isInstructor;
-
-        return {
-          ...cls,
-          courseCode: course?.code || 'N/A',
-          courseTitle: course?.title || cls.name,
-          studyProgram: course?.studyProgram || 'Teknik Informatika',
-          credits: course?.credits || 3,
-          semesterName: semester?.name || 'Semester Aktif',
-          instructors,
-          activeStudentCount: activeCount,
-          pendingEnrollmentCount: canManage ? pendingCount : 0,
-          joinCode: canManage ? activeCode?.code || null : null,
-          myEnrollmentStatus: myEnrollment?.status || null,
-          isInstructor,
-          canManage,
-          canEnter:
-            canManage ||
-            myEnrollment?.status === 'active' ||
-            myEnrollment?.status === 'completed',
-        };
-      })
-      .filter((item) => {
-        if (scope === 'mine') {
-          if (user.roles.includes('SUPERADMIN')) return true;
-          if (user.roles.includes('DOSEN')) return item.isInstructor;
-          return item.myEnrollmentStatus !== null;
-        }
-        return true;
-      })
-      .filter((item) => {
-        if (!search) return true;
-        return (
-          item.name.toLowerCase().includes(search) ||
-          item.courseCode.toLowerCase().includes(search) ||
-          item.courseTitle.toLowerCase().includes(search) ||
-          item.studyProgram.toLowerCase().includes(search)
-        );
-      });
-
-    const total = enriched.length;
-    const paginated = enriched.slice((page - 1) * limit, page * limit);
-
-    return sendSuccess(reply, paginated, {
-      page,
-      limit,
-      total,
-      totalPages: Math.max(1, Math.ceil(total / limit)),
-    });
-  });
+  // Role-scoped GET /api/v1/classrooms & POST /api/v1/classrooms/join are registered in classroomDirectoryRoutes.ts
 
   const createClassroomSchema = z.object({
-    courseId: z.string().uuid(),
-    semesterId: z.string().uuid(),
-    name: z.string().min(4),
-    section: z.string().min(2),
-    roomNumber: z.string().min(3),
-    scheduleText: z.string().min(4),
-    capacity: z.number().int().min(5).max(200),
-    enrollmentPolicy: z.enum(['AUTO', 'APPROVAL_REQUIRED']),
+    courseId: z.string().uuid().optional().nullable(),
+    semesterId: z.string().uuid().optional().nullable(),
+    academicPeriodId: z.string().uuid().optional().nullable(),
+    subjectName: z.string().optional().nullable(),
+    subjectCode: z.string().optional().nullable(),
+    academicYear: z.string().optional().nullable(),
+    semesterName: z.string().optional().nullable(),
+    locationDescription: z.string().optional().nullable(),
+    name: z.string().min(3),
+    section: z.string().min(1).default('A'),
+    roomNumber: z.string().optional().default('Daring / Fleksibel'),
+    scheduleText: z.string().optional().default('Sesuai Jadwal'),
+    capacity: z.number().int().min(5).max(250).default(35),
+    enrollmentPolicy: z.enum(['AUTO', 'APPROVAL_REQUIRED']).default('AUTO'),
+    visibility: z
+      .enum(['PUBLIC', 'PRIVATE', 'PUBLIC_ENROLLED', 'CAMPUS_WIDE', 'PRIVATE_RESTRICTED'])
+      .default('PRIVATE'),
     description: z.string().optional(),
   });
 
@@ -845,7 +1333,21 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
         const [newClass] = await tx
           .insert(classrooms)
           .values({
-            ...parsed.data,
+            courseId: parsed.data.courseId || null,
+            semesterId: parsed.data.semesterId || null,
+            academicPeriodId: parsed.data.academicPeriodId || null,
+            subjectName: parsed.data.subjectName || null,
+            subjectCode: parsed.data.subjectCode || null,
+            academicYear: parsed.data.academicYear || null,
+            semesterName: parsed.data.semesterName || null,
+            locationDescription: parsed.data.locationDescription || null,
+            name: parsed.data.name,
+            section: parsed.data.section,
+            roomNumber: parsed.data.locationDescription || parsed.data.roomNumber || 'Daring / Fleksibel',
+            scheduleText: parsed.data.scheduleText || 'Sesuai Jadwal',
+            capacity: parsed.data.capacity,
+            enrollmentPolicy: parsed.data.enrollmentPolicy,
+            visibility: parsed.data.visibility,
             description:
               parsed.data.description ||
               'Ruang kelas digital resmi Politeknik Kampar.',
@@ -921,201 +1423,21 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
     }
   });
 
-  // Student Join Classroom by Join Code (Transactional)
-  const joinClassroomSchema = z.object({
-    code: z.string().min(4).max(20),
-  });
-
-  fastify.post('/api/v1/classrooms/join', async (req, reply) => {
-    const user = await authenticateRequest(req, reply, {
-      requiredPermissions: ['enrollments:join'],
-    });
-    if (!user) return;
-
-    const parsed = joinClassroomSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return sendError(reply, 400, 'VALIDATION_ERROR', 'Kode kelas tidak valid.');
-    }
-
-    const normalizedCode = parsed.data.code.trim().toUpperCase();
-
-    try {
-      const outcome = await db.transaction(async (tx) => {
-        const codeRows = await tx
-          .select()
-          .from(classroomJoinCodes)
-          .where(
-            and(
-              eq(classroomJoinCodes.code, normalizedCode),
-              eq(classroomJoinCodes.isActive, true)
-            )
-          );
-
-        const joinCode = codeRows[0];
-        if (!joinCode) {
-          throw new Error('INVALID_OR_REVOKED_CODE');
-        }
-
-        const clsRows = await tx
-          .select()
-          .from(classrooms)
-          .where(eq(classrooms.id, joinCode.classroomId));
-        const cls = clsRows[0];
-        if (!cls || cls.status !== 'ACTIVE') {
-          throw new Error('CLASSROOM_INACTIVE');
-        }
-
-        // Check if user is already an instructor
-        const existingInstructor = await tx
-          .select()
-          .from(classroomInstructors)
-          .where(
-            and(
-              eq(classroomInstructors.classroomId, cls.id),
-              eq(classroomInstructors.instructorId, user.id)
-            )
-          );
-        if (existingInstructor.length > 0) {
-          throw new Error('ALREADY_INSTRUCTOR');
-        }
-
-        // Prevent duplicate enrollment
-        const existingEnrollment = await tx
-          .select()
-          .from(classroomEnrollments)
-          .where(
-            and(
-              eq(classroomEnrollments.classroomId, cls.id),
-              eq(classroomEnrollments.studentId, user.id)
-            )
-          );
-
-        if (existingEnrollment.length > 0) {
-          const current = existingEnrollment[0];
-          if (current.status === 'active' || current.status === 'pending') {
-            throw new Error('DUPLICATE_ENROLLMENT');
-          }
-        }
-
-        // Enforce classroom capacity
-        const activeEnrollments = await tx
-          .select()
-          .from(classroomEnrollments)
-          .where(
-            and(
-              eq(classroomEnrollments.classroomId, cls.id),
-              eq(classroomEnrollments.status, 'active')
-            )
-          );
-
-        if (activeEnrollments.length >= cls.capacity) {
-          throw new Error('CAPACITY_EXCEEDED');
-        }
-
-        const targetStatus =
-          cls.enrollmentPolicy === 'AUTO' ? 'active' : 'pending';
-
-        const historyEntry = {
-          status: targetStatus,
-          changedAt: new Date().toISOString(),
-          actorId: user.id,
-          reason:
-            targetStatus === 'active'
-              ? `Auto-enrolled via code ${normalizedCode}`
-              : `Pending instructor approval via code ${normalizedCode}`,
-        };
-
-        if (existingEnrollment.length > 0) {
-          const prevHistory = Array.isArray(existingEnrollment[0].statusHistory)
-            ? existingEnrollment[0].statusHistory
-            : [];
-          const [updated] = await tx
-            .update(classroomEnrollments)
-            .set({
-              status: targetStatus,
-              joinCodeUsed: normalizedCode,
-              statusHistory: [...prevHistory, historyEntry],
-              updatedAt: new Date(),
-            })
-            .where(eq(classroomEnrollments.id, existingEnrollment[0].id))
-            .returning();
-          return { enrollment: updated, classroom: cls };
-        }
-
-        const [inserted] = await tx
-          .insert(classroomEnrollments)
-          .values({
-            classroomId: cls.id,
-            studentId: user.id,
-            status: targetStatus,
-            joinCodeUsed: normalizedCode,
-            statusHistory: [historyEntry],
-          })
-          .returning();
-
-        return { enrollment: inserted, classroom: cls };
-      });
-
-      await recordAuditLog({
-        actorId: user.id,
-        action: 'CLASSROOM_JOIN_REQUESTED',
-        entityType: 'ENROLLMENT',
-        entityId: outcome.enrollment.id,
-        metadata: {
-          classroomId: outcome.classroom.id,
-          status: outcome.enrollment.status,
-          joinCode: normalizedCode,
-        },
-        ipAddress: req.ip,
-      });
-
-      return sendSuccess(reply, outcome, null, 201);
-    } catch (error: any) {
-      const code = error.message;
-      if (code === 'INVALID_OR_REVOKED_CODE') {
-        return sendError(
-          reply,
-          404,
-          code,
-          'Kode kelas tidak ditemukan atau telah dicabut oleh Dosen.'
-        );
-      }
-      if (code === 'DUPLICATE_ENROLLMENT') {
-        return sendError(
-          reply,
-          409,
-          code,
-          'Anda sudah terdaftar atau sedang menunggu persetujuan di kelas ini.'
-        );
-      }
-      if (code === 'CAPACITY_EXCEEDED') {
-        return sendError(
-          reply,
-          422,
-          code,
-          'Kapasitas maksimum ruang kelas ini telah penuh.'
-        );
-      }
-      if (code === 'ALREADY_INSTRUCTOR') {
-        return sendError(
-          reply,
-          409,
-          code,
-          'Anda adalah Dosen Pengampu pada ruang kelas ini.'
-        );
-      }
-      return sendError(reply, 400, 'JOIN_FAILED', 'Gagal bergabung ke ruang kelas.');
-    }
-  });
-
   // ============================================================================
   // 5. FULL CLASSROOM WORKSPACE (STREAM, CLASSWORK, PEOPLE, GRADES, SETTINGS)
   // ============================================================================
   fastify.get('/api/v1/classrooms/:id', async (req, reply) => {
-    const user = await authenticateRequest(req, reply);
+    const user = await authenticateRequest(req, reply, {
+      anyPermissions: ['classrooms:view', 'classrooms:manage_all', 'classrooms:teach'],
+    });
     if (!user) return;
 
     const { id } = req.params as { id: string };
+
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    if (!isUuid) {
+      return sendError(reply, 404, 'CLASSROOM_NOT_FOUND', 'Ruang kelas tidak ditemukan.');
+    }
 
     const clsRows = await db
       .select()
@@ -1138,14 +1460,18 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
       );
     }
 
-    const [course] = await db
-      .select()
-      .from(courses)
-      .where(eq(courses.id, cls.courseId));
-    const [semester] = await db
-      .select()
-      .from(semesters)
-      .where(eq(semesters.id, cls.semesterId));
+    const [course] = cls.courseId
+      ? await db
+          .select()
+          .from(courses)
+          .where(eq(courses.id, cls.courseId))
+      : [];
+    const [semester] = cls.semesterId
+      ? await db
+          .select()
+          .from(semesters)
+          .where(eq(semesters.id, cls.semesterId))
+      : [];
 
     // Instructors
     const instructors = await db
@@ -1542,8 +1868,12 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
     return sendSuccess(reply, {
       classroom: {
         ...cls,
-        course,
-        semester,
+        courseCode: cls.subjectCode || course?.code || 'N/A',
+        courseTitle: cls.subjectName || course?.title || cls.name,
+        semesterName: cls.semesterName || semester?.name || 'Semester Aktif',
+        locationDescription: cls.locationDescription || cls.roomNumber,
+        course: course || null,
+        semester: semester || null,
       },
       access,
       instructors,
@@ -1580,6 +1910,11 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
     if (!user) return;
 
     const { id } = req.params as { id: string };
+
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    if (!isUuid) {
+      return sendError(reply, 404, 'CLASSROOM_NOT_FOUND', 'Ruang kelas tidak ditemukan.');
+    }
     const access = await checkClassroomAccess(user, id);
     if (!access.canManage) {
       return sendError(
@@ -1794,6 +2129,11 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
     if (!user) return;
 
     const { id } = req.params as { id: string };
+
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    if (!isUuid) {
+      return sendError(reply, 404, 'CLASSROOM_NOT_FOUND', 'Ruang kelas tidak ditemukan.');
+    }
     const access = await checkClassroomAccess(user, id);
     if (!access.canManage) {
       return sendError(
@@ -1833,6 +2173,11 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
     if (!user) return;
 
     const { id } = req.params as { id: string };
+
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    if (!isUuid) {
+      return sendError(reply, 404, 'CLASSROOM_NOT_FOUND', 'Ruang kelas tidak ditemukan.');
+    }
     const access = await checkClassroomAccess(user, id);
     if (!access.canView) {
       return sendError(
@@ -1871,6 +2216,11 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
     if (!user) return;
 
     const { id } = req.params as { id: string };
+
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    if (!isUuid) {
+      return sendError(reply, 404, 'CLASSROOM_NOT_FOUND', 'Ruang kelas tidak ditemukan.');
+    }
     const access = await checkClassroomAccess(user, id);
     if (!access.canManage) {
       return sendError(reply, 403, 'FORBIDDEN', 'Hanya Dosen yang dapat menambah topik.');
@@ -1913,6 +2263,11 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
     if (!user) return;
 
     const { id } = req.params as { id: string };
+
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    if (!isUuid) {
+      return sendError(reply, 404, 'CLASSROOM_NOT_FOUND', 'Ruang kelas tidak ditemukan.');
+    }
     const access = await checkClassroomAccess(user, id);
     if (!access.canManage) {
       return sendError(
@@ -2006,6 +2361,11 @@ export async function registerApiRoutes(fastify: FastifyInstance) {
     if (!user) return;
 
     const { id } = req.params as { id: string };
+
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+    if (!isUuid) {
+      return sendError(reply, 404, 'CLASSROOM_NOT_FOUND', 'Ruang kelas tidak ditemukan.');
+    }
     const access = await checkClassroomAccess(user, id);
     if (!access.canManage) {
       return sendError(reply, 403, 'FORBIDDEN', 'Hanya Dosen yang dapat membuat kuis.');

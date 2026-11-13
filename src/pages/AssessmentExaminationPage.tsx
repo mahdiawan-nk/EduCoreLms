@@ -17,6 +17,7 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import { ModalDialog } from '../components/ui/primitives';
 import {
   TiptapMaterialEditor,
   TiptapReadOnlyRenderer,
@@ -926,43 +927,39 @@ export const AssessmentExaminationPage: React.FC = () => {
         </main>
 
         {/* Submit Confirmation Modal */}
-        {confirmSubmitOpen && (
-          <div className="fixed inset-0 z-50 bg-slate-900/60 flex items-center justify-center p-4">
-            <div className="bg-white rounded-2xl border border-slate-200 max-w-md w-full p-6 space-y-4">
-              <div className="flex items-center gap-3">
-                <AlertTriangle className="w-6 h-6 text-amber-600 shrink-0" />
-                <h3 className="text-base font-bold text-slate-900">
-                  Konfirmasi Pengumpulan Ujian Akhir
-                </h3>
-              </div>
-              <p className="text-xs text-slate-600 leading-relaxed">
-                Pastikan seluruh jawaban Anda telah diperiksa. Setelah dikumpulkan, jawaban tidak dapat diubah lagi.
-              </p>
-              <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 font-mono text-xs space-y-1">
-                <div>Soal Terjawab: {answeredCount} dari {questions.length}</div>
-                <div>Soal Belum Dijawab: {unansweredCount}</div>
-                <div>Soal Ditandai Ragu-Ragu: {flaggedCount}</div>
-              </div>
-              <div className="flex items-center justify-end gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setConfirmSubmitOpen(false)}
-                  className="px-4 py-2 rounded-lg border border-slate-300 text-xs font-bold text-slate-700"
-                >
-                  Kembali Periksa
-                </button>
-                <button
-                  type="button"
-                  disabled={submitting}
-                  onClick={() => handleFinalSubmit(false)}
-                  className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold"
-                >
-                  {submitting ? 'Mengumpulkan...' : 'Ya, Kumpulkan Sekarang'}
-                </button>
-              </div>
+        <ModalDialog
+          open={confirmSubmitOpen}
+          onClose={() => !submitting && setConfirmSubmitOpen(false)}
+          title="Konfirmasi Pengumpulan Ujian Akhir"
+          description="Pastikan seluruh jawaban Anda telah diperiksa. Setelah dikumpulkan, jawaban tidak dapat diubah lagi."
+          maxWidth="max-w-md"
+        >
+          <div className="space-y-4">
+            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 font-mono text-xs space-y-1">
+              <div>Soal Terjawab: {answeredCount} dari {questions.length}</div>
+              <div>Soal Belum Dijawab: {unansweredCount}</div>
+              <div>Soal Ditandai Ragu-Ragu: {flaggedCount}</div>
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setConfirmSubmitOpen(false)}
+                disabled={submitting}
+                className="px-4 py-2 rounded-lg border border-slate-300 text-xs font-bold text-slate-700 cursor-pointer"
+              >
+                Kembali Periksa
+              </button>
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => handleFinalSubmit(false)}
+                className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold cursor-pointer"
+              >
+                {submitting ? 'Mengumpulkan...' : 'Ya, Kumpulkan Sekarang'}
+              </button>
             </div>
           </div>
-        )}
+        </ModalDialog>
       </div>
     );
   }

@@ -1,5 +1,10 @@
 let inMemoryCsrfToken = '';
 let inMemoryBearerToken = '';
+let onUnauthorizedCallback: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+  onUnauthorizedCallback = handler;
+}
 
 export function setApiSecurityTokens(tokens: {
   csrfToken?: string;
@@ -50,7 +55,15 @@ export async function apiRequest<T>(
     ...((options.headers as Record<string, string>) || {}),
   };
 
-  const response = await fetch(`/api/v1${endpoint}`, {
+  const normalizedEndpoint = endpoint.startsWith('/api/v1')
+    ? endpoint.slice('/api/v1'.length)
+    : endpoint.startsWith('api/v1')
+    ? '/' + endpoint.slice('api/v1'.length)
+    : endpoint.startsWith('/')
+    ? endpoint
+    : `/${endpoint}`;
+
+  const response = await fetch(`/api/v1${normalizedEndpoint}`, {
     ...options,
     credentials: 'include',
     headers,
@@ -73,8 +86,25 @@ export async function apiRequest<T>(
   if (!response.ok || !payload || !payload.success) {
     const errMessage =
       payload?.error?.message || `Permintaan gagal (${response.status})`;
-    const err = new Error(errMessage) as Error & { code?: string };
+    const err = new Error(errMessage) as Error & {
+      code?: string;
+      status?: number;
+      details?: unknown[];
+    };
     err.code = payload?.error?.code || 'API_ERROR';
+    err.status = response.status;
+    err.details = payload?.error?.details || [];
+
+    // Notify auth context on unexpected 401s during user interaction
+    // (excluding login endpoint and session validation endpoint)
+    if (
+      response.status === 401 &&
+      !endpoint.includes('/auth/login') &&
+      !endpoint.includes('/auth/me')
+    ) {
+      onUnauthorizedCallback?.();
+    }
+
     throw err;
   }
 
@@ -90,5 +120,36 @@ export async function apiFetch<T>(
     : url;
   const envelope = await apiRequest<T>(normalizedEndpoint, options);
   return envelope.data;
+}
+
+export async function startImpersonation(targetUserId: string, reason?: string) {
+  return apiRequest<{
+    user: any;
+    csrfToken: string;
+    impersonation: any;
+  }>('/auth/impersonation/start', {
+    method: 'POST',
+    body: JSON.stringify({ targetUserId, reason }),
+  });
+}
+
+export async function stopImpersonation() {
+  return apiRequest<{
+    user: any;
+    csrfToken: string;
+    impersonation: null;
+  }>('/auth/impersonation/stop', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function getImpersonationStatus() {
+  return apiRequest<{
+    isImpersonating: boolean;
+    originalUser: { id: string; name: string; email: string; role: string } | null;
+    effectiveUser: { id: string; name: string; email: string; role: string };
+    impersonation: any;
+  }>('/auth/impersonation/status');
 }
 

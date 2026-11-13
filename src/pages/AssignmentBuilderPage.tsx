@@ -27,7 +27,8 @@ import {
   TiptapReadOnlyRenderer,
 } from '../components/TiptapMaterialEditor';
 import { DocumentPreviewModal } from '../components/DocumentPreviewModal';
-import { Button, Input, Textarea } from '../components/ui/primitives';
+import { Button, Input, Textarea, ConfirmDialog } from '../components/ui/primitives';
+import { useDeleteConfirmation } from '../hooks/useDeleteConfirmation';
 
 const ALL_EXTENSION_OPTIONS = [
   'pdf',
@@ -465,16 +466,24 @@ export function AssignmentBuilderPage() {
     }
   };
 
-  const handleRemoveAttachment = async (attachmentId: string) => {
-    try {
-      await apiFetch(`/api/v1/assignment-attachments/${attachmentId}`, {
-        method: 'DELETE',
-      });
-      setAttachments((prev) => prev.filter((a) => a.id !== attachmentId));
-      toast.success('Berkas lampiran dihapus.');
-    } catch (err: any) {
-      toast.error(err.message || 'Gagal menghapus lampiran.');
-    }
+  const deleteConfirm = useDeleteConfirmation();
+
+  const handleRemoveAttachment = (attachmentId: string, fileName?: string) => {
+    deleteConfirm.requestConfirmation({
+      item: attachmentId,
+      title: 'Hapus Lampiran Tugas?',
+      description: 'Apakah Anda yakin ingin menghapus berkas lampiran tugas ini?',
+      itemName: fileName || 'Lampiran Tugas',
+      warningText: 'Berkas referensi akan dihapus dari tugas dan tidak lagi terlihat oleh mahasiswa.',
+      actionLabel: 'Ya, Hapus Lampiran',
+      successMessage: 'Berkas lampiran dihapus.',
+      onConfirm: async (id) => {
+        await apiFetch(`/api/v1/assignment-attachments/${id}`, {
+          method: 'DELETE',
+        });
+        setAttachments((prev) => prev.filter((a) => a.id !== id));
+      },
+    });
   };
 
   const toggleExtension = (ext: string) => {
@@ -1484,6 +1493,7 @@ export function AssignmentBuilderPage() {
         attachment={previewTarget?.attachment || null}
         preview={previewTarget?.preview || null}
       />
+      <ConfirmDialog {...deleteConfirm.dialogProps} />
     </div>
   );
 }

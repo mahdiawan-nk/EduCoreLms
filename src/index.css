@@ -6,12 +6,33 @@
     --font-display: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
     --font-sans: 'Public Sans', -apple-system, BlinkMacSystemFont, sans-serif;
     --font-mono: 'IBM Plex Mono', monospace;
+
+    /* Academic Theme Design Tokens (Default: Academic Modern) */
+    --theme-sidebar-bg: #0F172A;
+    --theme-sidebar-text: #CBD5E1;
+    --theme-sidebar-active-bg: #1D4ED8;
+    --theme-sidebar-active-text: #FFFFFF;
+    --theme-topbar-bg: #FFFFFF;
+    --theme-topbar-text: #0F172A;
+    --theme-content-bg: #F7F9FC;
+    --theme-surface-bg: #F1F5F9;
+    --theme-card-bg: #FFFFFF;
+    --theme-border: #E2E8F0;
+    --theme-primary: #1D4ED8;
+    --theme-secondary: #334155;
+    --theme-accent: #D97706;
+    --theme-text-primary: #0F172A;
+    --theme-text-secondary: #475569;
+    --theme-success: #15803D;
+    --theme-warning: #B45309;
+    --theme-danger: #B91C1C;
+    --theme-focus-ring: rgba(29, 78, 216, 0.25);
   }
 
   body {
     font-family: var(--font-sans);
-    color: #0f172a;
-    background-color: #f8fafc;
+    color: var(--theme-text-primary);
+    background-color: var(--theme-content-bg);
   }
 
   h1, h2, h3, h4, h5, h6 {
