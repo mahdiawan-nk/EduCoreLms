@@ -13,11 +13,13 @@
 - [System Architecture](#system-architecture)
 - [Prerequisites](#prerequisites)
 - [Local Development Installation](#local-development-installation)
+- [Database Seeding](#database-seeding)
 - [Environment Configuration](#environment-configuration)
 - [Application Modes](#application-modes)
 - [Production Deployment (Linux + Nginx + HTTPS)](#production-deployment-linux--nginx--https)
 - [Updating Production](#updating-production)
 - [Database Backup & Recovery](#database-backup--recovery)
+  - [Superadmin Emergency Account Recovery (`scripts/recover-superadmin.ts`)](#superadmin-emergency-account-recovery-scriptsrecover-superadmints)
 - [Troubleshooting](#troubleshooting)
 - [Security Best Practices](#security-best-practices)
 - [Project Directory Structure](#project-directory-structure)
@@ -181,6 +183,54 @@ Ensure the following tools are installed on your development or production machi
    npm run lint
    npm test
    ```
+
+---
+
+## Database Seeding
+
+EduCoreLMS uses **automatic, idempotent lazy seeding** rather than a separate `npm run seed` script. After pushing or migrating the database schema (`npm run db:push` or `npm run db:migrate`), initial data is populated automatically when the application starts receiving API requests:
+
+| Seed Module | Trigger Mechanism | What Gets Seeded |
+| :--- | :--- | :--- |
+| **`ensureSeeded()`** (`src/server/seed.ts`) | Automatically invoked via Fastify `preHandler` hook in `src/server/routes.ts` on the first request to `/api/v1/*` when the `roles` table is empty. | Canonical roles (`SUPERADMIN`, `DOSEN`, `MAHASISWA`, `AUDITOR`), RBAC permissions & role mappings, initial users & profiles, academic years/semesters, courses, classrooms, enrollments, materials, assignments, quizzes, gradebooks, and notifications. |
+| **`ensureKnowledgeCenterSeeded()`** (`src/server/knowledgeSeed.ts`) | Automatically invoked on the first request to Knowledge Center routes (`src/server/knowledgeCenterRoutes.ts`) when categories/articles are empty. | Knowledge Center categories, tags, role-targeted documentation articles, FAQs, and initial article versions. |
+| **`ensureSeededAssessmentsAndQuestionBanks()`** (`src/server/assessmentRoutes.ts`) | Automatically invoked when assessment routes are accessed and no assessment/question bank records exist. | Initial question banks and sample assessments. |
+
+### How to Run Seeding
+
+1. **Standard Method (Recommended):**
+   Start the server (`npm run dev` or `npm run start`) and open `http://localhost:3000/` in your browser, or send a request to any `/api/v1/*` endpoint:
+
+   ```bash
+   curl -s http://localhost:3000/api/v1/auth/me
+   ```
+
+   If the database is empty, `ensureSeeded()` runs inside a PostgreSQL transaction and logs:
+   `Politeknik Kampar LMS database seed completed successfully.`
+
+2. **Direct CLI Trigger (Without Browser Traffic):**
+   If you want to pre-populate the core seed and Knowledge Center data directly from the terminal during provisioning:
+
+   ```bash
+   npx tsx -e "import { ensureSeeded } from './src/server/seed.ts'; import { ensureKnowledgeCenterSeeded } from './src/server/knowledgeSeed.ts'; await ensureSeeded(); await ensureKnowledgeCenterSeeded(); process.exit(0);"
+   ```
+
+### Default Seeded User Accounts
+
+When `ensureSeeded()` initializes an empty database, the following development user accounts are created in [src/server/seed.ts](file:///home/mahdi-nk/Project/EduCoreLms/src/server/seed.ts):
+
+| Role | Name | Email | Default Password |
+| :--- | :--- | :--- | :--- |
+| `SUPERADMIN` | Ir. Hendra Pratama, M.Kom. | `superadmin@poltek-kampar.ac.id` | `AdminPolkam#2026` |
+| `DOSEN` | Dr. Fitriani Syahrir, S.T., M.T. | `fitriani.dosen@poltek-kampar.ac.id` | `DosenPolkam#2026` |
+| `DOSEN` | M. Ridwan Nasution, S.Kom., M.Cs. | `ridwan.dosen@poltek-kampar.ac.id` | `DosenPolkam#2026` |
+| `MAHASISWA` | Ahmad Fauzan Al-Farisi | `ahmad.mhs@student.poltek-kampar.ac.id` | `MhsPolkam#2026` |
+| `MAHASISWA` | Siti Rahmawati Putri | `siti.mhs@student.poltek-kampar.ac.id` | `MhsPolkam#2026` |
+| `MAHASISWA` | Dimas Wahyu Saputra | `dimas.mhs@student.poltek-kampar.ac.id` | `MhsPolkam#2026` |
+
+*(Note: The `AUDITOR` role is seeded in the `roles` table, but no default `AUDITOR` user account is created automatically. You can create an `AUDITOR` account via User Management while logged in as `SUPERADMIN`.)*
+
+> **Security Note:** These credentials are for local development and initial setup only. In staging or production environments, change all initial passwords immediately after first login or rotate the Superadmin password using `scripts/recover-superadmin.ts`.
 
 ---
 
@@ -355,15 +405,51 @@ pg_dump -h 127.0.0.1 -U postgres -F c -b -v -f "educore_backup_$(date +%Y%m%d_%H
 pg_restore -h 127.0.0.1 -U postgres -d polkam_database --clean --if-exists -v educore_backup_YYYYMMDD_HHMMSS.dump
 ```
 
-### Superadmin Emergency Account Recovery
+### Superadmin Emergency Account Recovery (`scripts/recover-superadmin.ts`)
 
-If the primary Superadmin account is locked out or the password is forgotten, **do not** modify password hashes directly in PostgreSQL. Use the official server CLI script:
+If the primary Superadmin account is locked out or the password is forgotten, **do not** modify password hashes directly in PostgreSQL. Use the official server CLI script [scripts/recover-superadmin.ts](file:///home/mahdi-nk/Project/EduCoreLms/scripts/recover-superadmin.ts).
+
+#### Prerequisites
+
+- Execute the command on the application server (or local workspace) with a valid `.env` containing `SQL_HOST`, `SQL_USER`, `SQL_PASSWORD`, and `SQL_DB_NAME` (or `DATABASE_URL`).
+- The target account must exist in `users`, hold the `SUPERADMIN` role, and have `isActive = true` with `accountStatus = 'ACTIVE'`.
+
+#### Usage
+
+Run the script using **Bun** or **TSX**, passing **only** the Superadmin email address:
 
 ```bash
 bun run scripts/recover-superadmin.ts <superadmin-email>
 ```
 
-This script validates the environment, verifies that the account is active and holds the `SUPERADMIN` role, prompts for interactive confirmation, enforces password complexity and history policies, hashes the new password using Argon2, invalidates active sessions, forces a password change on next login (if applicable), and writes an entry to `audit_logs`.
+*(Alternative using Node.js / TSX:)*
+
+```bash
+npx tsx scripts/recover-superadmin.ts <superadmin-email>
+```
+
+#### Step-by-Step Interactive Flow
+
+1. **Environment & Target Validation:** The script verifies database environment variables, looks up the account by email, and confirms it is an active `SUPERADMIN` account. Invalid or unauthorized attempts are recorded in `audit_logs`.
+2. **Account Identity Display & Confirmation:** The CLI prints `Nama`, `Email`, `Role`, and `Status`, then prompts for explicit confirmation:
+
+   ```text
+   Ketik RECOVER-SUPERADMIN untuk melanjutkan pemulihan:
+   ```
+
+   Type `RECOVER-SUPERADMIN` and press **Enter** to proceed.
+3. **Cryptographic Recovery Execution:** Inside a database transaction, the script:
+   - Generates a one-time cryptographic temporary password compliant with the configured password policy (`PASSWORD_MIN_LENGTH`, `PASSWORD_MAX_LENGTH`).
+   - Hashes the password with **Argon2id** and records it in password history.
+   - Revokes all active `user_sessions` (and impersonation sessions) for the account.
+   - Enforces `mustResetPassword = true` with an expiration window (`TEMP_PASSWORD_EXPIRATION_HOURS`, default `24` hours).
+   - Writes a `SUPERADMIN_PASSWORD_RECOVERY` event to `audit_logs`.
+4. **Post-Recovery Login:**
+   - Copy the **one-time temporary password** printed in the terminal immediately (it is never displayed again).
+   - Log in at `/login` using the Superadmin email and temporary password.
+   - Complete the mandatory password change screen to set a new permanent password.
+
+> **Security Rule:** Never pass passwords or extra flags as CLI arguments to `scripts/recover-superadmin.ts`. The script strictly rejects commands with more than one argument (`process.argv.length > 3`).
 
 ---
 
